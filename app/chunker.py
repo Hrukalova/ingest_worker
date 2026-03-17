@@ -1,80 +1,37 @@
-# services/ingest_worker/chunker.py
-"""
-Новичок №2 — "The Indexer": SemanticChunker
-============================================
-Реализует:
-1. Semantic Splitting   — нарезка текста на чанки с порогом t_sim по косинусному сходству.
-2. Header Injection     — вклейка "хлебных крошек" из иерархии topics в начало каждого чанка.
-
-Алгоритм Semantic Splitting (аналог Kaggle-ноутбука):
-  ─ Разбиваем текст на «сырые» предложения.
-  ─ Создаём скользящее окно: каждый «буфер» объединяет предложение с N соседями.
-  ─ Считаем косинусное сходство между соседними буферами.
-  ─ Там, где сходство падает ниже порога t_sim, — точка разрыва (boundaries).
-  ─ Склеиваем предложения между разрывами → чанки.
-  ─ Чанки слишком длинные разбиваем по max_tokens, слишком короткие — объединяем.
-"""
-
 from __future__ import annotations
-
 import re
 import logging
 from typing import List, Dict, Optional
-
 import numpy as np
 
 logger = logging.getLogger("SemanticChunker")
-
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
 def _split_sentences(text: str) -> List[str]:
-    """Простая сегментация на предложения по знакам препинания и переносам строк."""
-    # Разбиваем по . ! ? и переносам строк
+    """Сегментация на предложения."""
     raw = re.split(r"(?<=[.!?])\s+|\n{2,}", text)
-    # Убираем пустые и слишком короткие (< 3 слов) фрагменты
     return [s.strip() for s in raw if len(s.split()) >= 3]
 
-
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Косинусное сходство двух нормализованных векторов."""
+    """Косинусное сходство векторов."""
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
 
-
 def _token_count(text: str) -> int:
-    """Быстрая оценка числа токенов через слова (≈ 1.3 токена на слово)."""
+    """Оценка числа токенов."""
     return int(len(text.split()) * 1.3)
-
 
 # ---------------------------------------------------------------------------
 # Основной класс
 # ---------------------------------------------------------------------------
 
 class SemanticChunker:
-    """
-    Семантический чанкер с Header Injection.
-
-    Параметры
-    ----------
-    embedder : объект с методом .encode(texts) -> np.ndarray
-        Передаётся извне готовая модель (SentenceTransformer или любая другая).
-    t_sim : float
-        Порог косинусного сходства. Там, где sim < t_sim, ставим разрыв.
-        Типичное значение 0.45–0.55.
-    max_tokens : int
-        Максимальное число токенов в одном чанке.
-    min_tokens : int
-        Минимальное число токенов; слишком короткие чанки склеивает со следующим.
-    window_size : int
-        Размер скользящего окна (сколько предложений берём для буфера).
-    """
-
     def __init__(
         self,
         embedder=None,
@@ -89,10 +46,6 @@ class SemanticChunker:
         self.min_tokens = min_tokens
         self.window_size = window_size
 
-    # ------------------------------------------------------------------
-    # Публичный метод
-    # ------------------------------------------------------------------
-
     async def create_chunks(
         self,
         text: str,
@@ -100,25 +53,8 @@ class SemanticChunker:
         topic_breadcrumb: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Вход:
-            text             — чистый текст документа
-            doc_title        — название документа (для Header Injection)
-            topic_breadcrumb — строка вида "Категория: Про деньги > Стипендии > Правительства РФ"
-                               (формируется снаружи из листа topics)
-
-        Выход:
-            Список словарей:
-            {
-                "text": "<заголовок>\n<контент>",   # финальный текст чанка с инжектью
-                "meta": {
-                    "chunk_index": int,
-                    "start_sentence": int,
-                    "end_sentence": int,
-                    "token_count": int,
-                    "doc_title": str,
-                    "topic_breadcrumb": str | None,
-                }
-            }
+        Вход: текст, заголовок, хлебные крошки.
+        Выход: список чанков с метаданными и офсетами.
         """
         if not text or not text.strip():
             logger.warning(f"Пустой текст для документа '{doc_title}', пропускаем.")
@@ -126,26 +62,32 @@ class SemanticChunker:
 
         sentences = _split_sentences(text)
         if not sentences:
-            # Если текст не разбился — один чанк из всего текста
             sentences = [text.strip()]
 
-        # Если предложений мало — не нужен semantic split
+        # Основной выбор алгоритма
         if len(sentences) <= 3 or self.embedder is None:
-            chunks_text = self._simple_fallback(sentences)
+            # Передаем исходный текст для расчета офсетов
+            raw_chunks = self._simple_fallback(text, sentences)
         else:
-            chunks_text = self._semantic_split(sentences)
+            raw_chunks = self._semantic_split(text, sentences)
 
         result = []
-        for idx, (chunk_text, meta) in enumerate(chunks_text):
-            # Header Injection
+        for idx, (chunk_text, meta) in enumerate(raw_chunks):
+            # Header Injection (Requirement 4)
             header = self._build_header(doc_title, topic_breadcrumb)
             final_text = f"{header}\n{chunk_text}"
+
+            # Попытка извлечь заголовок секции (для section_path)
+            # Берем первое предложение чанка, если оно похоже на заголовок (короткое)
+            first_sent = chunk_text.split('\n')[0]
+            section = first_sent[:100] if len(first_sent) < 120 else None
 
             meta.update({
                 "chunk_index": idx,
                 "token_count": _token_count(final_text),
                 "doc_title": doc_title,
                 "topic_breadcrumb": topic_breadcrumb,
+                "section_path": section
             })
             result.append({"text": final_text, "meta": meta})
 
@@ -159,15 +101,7 @@ class SemanticChunker:
     # Семантическое разбиение
     # ------------------------------------------------------------------
 
-    def _semantic_split(self, sentences: List[str]) -> List[tuple]:
-        """
-        Основной алгоритм:
-        1. Строим «буферные» представления (скользящее окно).
-        2. Векторизуем буферы.
-        3. Ищем точки разрыва по порогу t_sim.
-        4. Дополнительные разрывы по max_tokens.
-        5. Склеиваем слишком маленькие чанки.
-        """
+    def _semantic_split(self, full_text: str, sentences: List[str]) -> List[tuple]:
         # --- 1. Буферы ---
         buffers = []
         for i, _ in enumerate(sentences):
@@ -179,31 +113,28 @@ class SemanticChunker:
         try:
             embeddings = self.embedder.encode(buffers, show_progress_bar=False)
         except Exception as e:
-            logger.error(f"Ошибка векторизации в chunker: {e}. Используем fallback.")
-            return self._simple_fallback(sentences)
+            logger.error(f"Ошибка векторизации: {e}. Используем fallback.")
+            return self._simple_fallback(full_text, sentences)
 
         # --- 3. Точки разрыва по сходству ---
         boundaries = set()
         for i in range(len(embeddings) - 1):
             sim = _cosine_similarity(embeddings[i], embeddings[i + 1])
             if sim < self.t_sim:
-                boundaries.add(i + 1)  # разрыв перед предложением i+1
+                boundaries.add(i + 1)
 
         # --- 4. Дополнительные разрывы по max_tokens ---
         boundaries = self._add_token_boundaries(sentences, boundaries)
 
-        # --- 5. Сборка чанков ---
-        raw_chunks = self._assemble_chunks(sentences, boundaries)
+        # --- 5. Сборка чанков (ТЕПЕРЬ С ОФСЕТАМИ) ---
+        raw_chunks = self._assemble_chunks(full_text, sentences, boundaries)
 
         # --- 6. Склейка мелких чанков ---
         raw_chunks = self._merge_small_chunks(raw_chunks)
 
         return raw_chunks
 
-    def _add_token_boundaries(
-        self, sentences: List[str], boundaries: set
-    ) -> set:
-        """Принудительно добавляем разрыв, если накопилось > max_tokens токенов."""
+    def _add_token_boundaries(self, sentences: List[str], boundaries: set) -> set:
         result = set(boundaries)
         current_tokens = 0
         current_start = 0
@@ -215,36 +146,66 @@ class SemanticChunker:
                 current_start = i + 1
         return result
 
-    def _assemble_chunks(
-        self, sentences: List[str], boundaries: set
-    ) -> List[tuple]:
-        """Соединяем предложения в чанки и отдаём вместе с метаданными."""
+    def _assemble_chunks(self, full_text: str, sentences: List[str], boundaries: set) -> List[tuple]:
+        """
+        Собирает предложения в чанки и вычисляет офсеты (Requirement 10).
+        """
         chunks = []
-        current: List[str] = []
-        start_idx = 0
+        current_sentences = []
+        start_sentence_idx = 0
+
+        # Мы отслеживаем текущую позицию поиска в тексте, чтобы не найти одинаковые предложения в разных местах
+        search_pos = 0
+
         for i, sent in enumerate(sentences):
-            if i in boundaries and current:
-                chunks.append((" ".join(current), {"start_sentence": start_idx, "end_sentence": i - 1}))
-                current = []
-                start_idx = i
-            current.append(sent)
-        if current:
-            chunks.append((" ".join(current), {"start_sentence": start_idx, "end_sentence": len(sentences) - 1}))
+            if i in boundaries and current_sentences:
+                chunk_body = " ".join(current_sentences)
+
+                # Находим точные границы текста
+                start_off = full_text.find(current_sentences[0], search_pos)
+                last_sent = current_sentences[-1]
+                end_off = full_text.find(last_sent, start_off) + len(last_sent)
+
+                # Обновляем позицию поиска, чтобы следующий чанк искался после этого
+                search_pos = start_off
+
+                chunks.append((chunk_body, {
+                    "start_offset": max(0, start_off),
+                    "end_offset": end_off,
+                    "start_sentence": start_sentence_idx,
+                    "end_sentence": i - 1
+                }))
+                current_sentences = []
+                start_sentence_idx = i
+
+            current_sentences.append(sent)
+
+        # Обработка последнего чанка
+        if current_sentences:
+            chunk_body = " ".join(current_sentences)
+            start_off = full_text.find(current_sentences[0], search_pos)
+            last_sent = current_sentences[-1]
+            end_off = full_text.find(last_sent, start_off) + len(last_sent)
+            chunks.append((chunk_body, {
+                "start_offset": max(0, start_off),
+                "end_offset": end_off,
+                "start_sentence": start_sentence_idx,
+                "end_sentence": len(sentences) - 1
+            }))
         return chunks
 
     def _merge_small_chunks(self, chunks: List[tuple]) -> List[tuple]:
-        """Объединяем чанки меньше min_tokens со следующим."""
-        if not chunks:
-            return chunks
+        if not chunks: return chunks
         merged = []
         i = 0
         while i < len(chunks):
             text, meta = chunks[i]
             if _token_count(text) < self.min_tokens and i + 1 < len(chunks):
-                # Склеиваем с следующим
                 next_text, next_meta = chunks[i + 1]
                 combined_text = text + " " + next_text
                 combined_meta = {
+                    "start_offset": meta["start_offset"],
+                    "end_offset": next_meta["end_offset"],
                     "start_sentence": meta["start_sentence"],
                     "end_sentence": next_meta["end_sentence"],
                 }
@@ -256,27 +217,21 @@ class SemanticChunker:
         return merged
 
     # ------------------------------------------------------------------
-    # Fallback (без модели или мало предложений)
+    # Fallback
     # ------------------------------------------------------------------
 
-    def _simple_fallback(self, sentences: List[str]) -> List[tuple]:
-        """Простая нарезка по max_tokens — используется при отсутствии embedder."""
-        chunks = []
-        current: List[str] = []
+    def _simple_fallback(self, full_text: str, sentences: List[str]) -> List[tuple]:
+        """Простая нарезка с сохранением офсетов."""
+        boundaries = set()
         current_tokens = 0
-        start_idx = 0
         for i, sent in enumerate(sentences):
             t = _token_count(sent)
-            if current_tokens + t > self.max_tokens and current:
-                chunks.append((" ".join(current), {"start_sentence": start_idx, "end_sentence": i - 1}))
-                current = []
+            if current_tokens + t > self.max_tokens:
+                boundaries.add(i)
                 current_tokens = 0
-                start_idx = i
-            current.append(sent)
             current_tokens += t
-        if current:
-            chunks.append((" ".join(current), {"start_sentence": start_idx, "end_sentence": len(sentences) - 1}))
-        return chunks
+
+        return self._assemble_chunks(full_text, sentences, boundaries)
 
     # ------------------------------------------------------------------
     # Header Injection
@@ -284,14 +239,6 @@ class SemanticChunker:
 
     @staticmethod
     def _build_header(doc_title: str, breadcrumb: Optional[str]) -> str:
-        """
-        Формирует заголовочный блок чанка.
-
-        Пример результата:
-            Документ: Положение о стипендиях МИЭМ
-            Категория: Про деньги > Стипендии > Правительства РФ
-            ---
-        """
         lines = [f"Документ: {doc_title}"]
         if breadcrumb:
             lines.append(f"Категория: {breadcrumb}")
