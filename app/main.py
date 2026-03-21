@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 # Импорт наших улучшенных модулей
 from parsers import get_content, parse_pdf, parse_docx, parse_txt
 from chunker import SemanticChunker
+from embedding_client import embed_texts
+
+
 
 load_dotenv()
 
@@ -22,7 +25,6 @@ load_dotenv()
 # 1. Конфигурация
 # ---------------------------------------------------------------------------
 DATABASE_URL  = os.environ["DATABASE_URL"]
-EMBEDDER_NAME = os.environ.get("EMBEDDER_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
 CHUNK_SIZE    = int(os.environ.get("CHUNK_SIZE", 1000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -79,7 +81,7 @@ class ChunkEmbedding(Base):
     __table_args__ = {"schema": "library"}
 
     chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("library.chunks.id", ondelete="CASCADE"), primary_key=True)
-    embedding: Mapped[list] = mapped_column(Vector(1536)) # Требование: 1536
+    embedding: Mapped[list] = mapped_column(Vector(1024)) # Требование: 1536
     embedding_model: Mapped[str] = mapped_column(Text)
 
 # ---------------------------------------------------------------------------
@@ -88,30 +90,14 @@ class ChunkEmbedding(Base):
 engine = create_async_engine(DATABASE_URL)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-try:
-    from sentence_transformers import SentenceTransformer
-    embedder = SentenceTransformer(EMBEDDER_NAME)
-    logger.info(f"✅ Модель {EMBEDDER_NAME} загружена")
-except Exception as e:
-    logger.error(f"❌ Ошибка загрузки модели: {e}")
-    embedder = None
+from chunker import SemanticChunker
+from embedding_client import embed_texts
 
-chunker = SemanticChunker(embedder=embedder, max_tokens=CHUNK_SIZE)
+chunker = SemanticChunker(embedder=embed_texts, max_tokens=CHUNK_SIZE)
 
-def _embed(texts: list) -> list:
-    """Генерация эмбеддингов с доведением до 1536 размерности (Этап 1)."""
-    if not embedder:
-        return [[0.0]*1536 for _ in texts]
-
-    vectors = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    result = []
-    for v in vectors:
-        v_list = v.tolist()
-        # Если модель дает 1024, дополняем нулями до 1536 по требованию босса
-        if len(v_list) < 1536:
-            v_list += [0.0] * (1536 - len(v_list))
-        result.append(v_list[:1536])
-    return result
+def _embed(texts: list[str]) -> list[list[float]]:
+    vectors = embed_texts(texts, normalize=True)
+    return [list(v) for v in vectors]
 
 async def process_one_document() -> bool:
     # Открываем сессию без автоматического начала транзакции

@@ -1,12 +1,9 @@
-# Python
 venv/
 __pycache__/
 *.pyc
 
-# Конфиденциальность
 .env
 
-# Локальные файлы и тесты
 *.pdf
 *.docx
 *.txt

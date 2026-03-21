@@ -111,7 +111,7 @@ class SemanticChunker:
 
         # --- 2. Векторизация ---
         try:
-            embeddings = self.embedder.encode(buffers, show_progress_bar=False)
+            embeddings = self.embedder(buffers)
         except Exception as e:
             logger.error(f"Ошибка векторизации: {e}. Используем fallback.")
             return self._simple_fallback(full_text, sentences)
