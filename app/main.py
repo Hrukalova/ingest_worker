@@ -26,7 +26,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DATABASE_URL  = os.environ["DATABASE_URL"]
 CHUNK_SIZE    = int(os.environ.get("CHUNK_SIZE", 1000))
-
+EMBEDDER_NAME = os.environ["EMBEDDER_NAME"]
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("IngestWorker")
 
