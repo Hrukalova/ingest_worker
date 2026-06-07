@@ -1,246 +1,374 @@
-from __future__ import annotations
-import re
-import logging
-from typing import List, Dict, Optional
-import numpy as np
+"""
+chunker.py — SmartChunker для ingest_worker
 
-logger = logging.getLogger("SemanticChunker")
+Итоги бенчмарка (cohesion score, чем выше — тем лучше смысловые границы):
+
+  Формат      Метод          cohesion   скорость
+  ─────────────────────────────────────────────
+  TXT         M2_Sentence    +0.047     мгновенно  ✅ ЛИДЕР
+  DOCX+hdg    M5_Structure   +0.035     мгновенно  ✅ ЛИДЕР
+  PDF+TOC     M5_Structure   ожидается  мгновенно  ✅
+  PDF без TOC M4_Recursive   +0.007     мгновенно  ✅ ЛИДЕР
+  M1_Fixed    везде          отриц.     мгновенно  ✗ не используем
+  M3_Semantic везде          -0.02      46–378 с   ✗ слишком медленно
+
+Стратегия выбора:
+  PDF  + есть TOC    → M5_Structure  (по главам оглавления из PyMuPDF)
+  PDF  без TOC       → M4_Recursive  (рекурсивная нарезка: \\n\\n→\\n→". ")
+  DOCX + Heading 1/2 → M5_Structure  (по heading-стилям)
+  DOCX без заголовков→ M2_Sentence   (по предложениям)
+  TXT  / прочее      → M2_Sentence   (по предложениям)
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import List, Dict, Optional
+
+logger = logging.getLogger("SmartChunker")
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+def _count_tokens(text: str) -> int:
+    """Быстрая оценка числа токенов (слова × 1.3)."""
+    return max(1, int(len(text.split()) * 1.3))
+
+
 def _split_sentences(text: str) -> List[str]:
-    """Сегментация на предложения."""
+    """Разбивка текста на предложения."""
     raw = re.split(r"(?<=[.!?])\s+|\n{2,}", text)
     return [s.strip() for s in raw if len(s.split()) >= 3]
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Косинусное сходство векторов."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
 
-def _token_count(text: str) -> int:
-    """Оценка числа токенов."""
-    return int(len(text.split()) * 1.3)
+def _build_header(doc_title: str, breadcrumb: Optional[str]) -> str:
+    lines = [f"Документ: {doc_title}"]
+    if breadcrumb:
+        lines.append(f"Категория: {breadcrumb}")
+    lines.append("---")
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
-# Основной класс
+# M2: Sentence-based — лучший для TXT, fallback для DOCX
+# Cohesion: +0.047 (TXT), оптимально для равномерной нарезки
 # ---------------------------------------------------------------------------
 
-class SemanticChunker:
+def _chunk_by_sentences(
+    text: str,
+    chunk_size: int = 512,
+    min_tokens: int = 50,
+) -> List[tuple]:
+    """
+    Нарезает текст по предложениям, группируя до chunk_size токенов.
+    Возвращает [(chunk_text, {start_offset, end_offset}), ...].
+    """
+    sentences = _split_sentences(text)
+    if not sentences:
+        return [(text.strip(), {"start_offset": 0, "end_offset": len(text)})]
+
+    chunks: List[tuple] = []
+    current: List[str] = []
+    current_tokens = 0
+    search_pos = 0
+
+    def _flush():
+        nonlocal search_pos
+        body = " ".join(current)
+        start = text.find(current[0], search_pos)
+        start = max(0, start)
+        end = start + len(body)
+        search_pos = start
+        chunks.append((body, {"start_offset": start, "end_offset": end}))
+
+    for sent in sentences:
+        t = _count_tokens(sent)
+        if current_tokens + t > chunk_size and current:
+            _flush()
+            current = []
+            current_tokens = 0
+        current.append(sent)
+        current_tokens += t
+
+    if current:
+        _flush()
+
+    # Склейка слишком мелких хвостовых чанков
+    if len(chunks) >= 2 and _count_tokens(chunks[-1][0]) < min_tokens:
+        prev_text, prev_meta = chunks[-2]
+        last_text, last_meta = chunks[-1]
+        merged = prev_text + " " + last_text
+        chunks[-2] = (merged, {
+            "start_offset": prev_meta["start_offset"],
+            "end_offset": last_meta["end_offset"],
+        })
+        chunks.pop()
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# M4: Recursive — лучший для PDF без структуры
+# Cohesion: +0.007, нулевое время, нет переполнения
+# ---------------------------------------------------------------------------
+
+def _chunk_recursive(
+    text: str,
+    chunk_size: int = 512,
+    overlap_tokens: int = 32,
+    separators: Optional[List[str]] = None,
+) -> List[tuple]:
+    """
+    Рекурсивно делит текст по иерархии разделителей:
+    \\n\\n → \\n → ". " → " "
+    Возвращает [(chunk_text, {start_offset, end_offset}), ...].
+    """
+    if separators is None:
+        separators = ["\n\n", "\n", ". ", " "]
+
+    def _split(t: str, seps: List[str]) -> List[str]:
+        if not seps:
+            return [t] if t.strip() else []
+        sep = seps[0]
+        parts = t.split(sep)
+        result: List[str] = []
+        current = ""
+        for part in parts:
+            candidate = (current + sep + part).strip() if current else part.strip()
+            if not candidate:
+                continue
+            if _count_tokens(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current:
+                    result.append(current)
+                if _count_tokens(part.strip()) <= chunk_size:
+                    current = part.strip()
+                else:
+                    sub = _split(part, seps[1:])
+                    result.extend(sub[:-1])
+                    current = sub[-1] if sub else ""
+        if current:
+            result.append(current)
+        return result
+
+    parts = [p for p in _split(text, separators) if p.strip()]
+    if not parts:
+        return [(text.strip(), {"start_offset": 0, "end_offset": len(text)})]
+
+    chunks: List[tuple] = []
+    search_pos = 0
+    prev_tail = ""
+
+    for body in parts:
+        # Перекрытие: добавляем хвост предыдущего чанка
+        if prev_tail:
+            body = prev_tail + " " + body
+            words = body.split()
+            if len(words) > int(chunk_size * 1.1):
+                body = " ".join(words[:chunk_size])
+
+        anchor = body[:50].strip()
+        start = text.find(anchor, search_pos)
+        start = max(0, start)
+        end = start + len(body)
+        search_pos = max(search_pos, start)
+        chunks.append((body, {"start_offset": start, "end_offset": end}))
+
+        words = body.split()
+        prev_tail = " ".join(words[-overlap_tokens:]) if overlap_tokens > 0 else ""
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# M5: Structure-aware — лучший для DOCX с heading / PDF с TOC
+# Cohesion: +0.035 (DOCX), intra_sim=0.727 (лучший в тесте)
+# ---------------------------------------------------------------------------
+
+_MIN_SECTION_TOKENS = 80   # меньше — склеивается с соседней секцией
+
+
+def _chunk_by_structure(
+    text: str,
+    sections: List[Dict],
+    chunk_size: int = 512,
+) -> List[tuple]:
+    """
+    Нарезает текст по готовым секциям (из TOC или Heading-стилей).
+    Секции с token_count > chunk_size дробятся рекурсивно (M4).
+    Слишком мелкие секции (<_MIN_SECTION_TOKENS) склеиваются.
+    Возвращает [(chunk_text, {start_offset, end_offset, section_title}), ...].
+    """
+    if not sections:
+        return _chunk_recursive(text, chunk_size)
+
+    raw: List[tuple] = []
+    search_pos = 0
+
+    for sec in sections:
+        sec_text = sec.get("text", "").strip()
+        title = sec.get("title", "")
+        if not sec_text:
+            continue
+
+        if _count_tokens(sec_text) <= chunk_size:
+            anchor = sec_text[:50]
+            start = text.find(anchor, search_pos)
+            start = max(0, start)
+            end = start + len(sec_text)
+            search_pos = max(search_pos, start)
+            raw.append((sec_text, {
+                "start_offset": start,
+                "end_offset": end,
+                "section_title": title,
+            }))
+        else:
+            # Большая секция — дробим M4
+            sub = _chunk_recursive(sec_text, chunk_size)
+            for sc_text, sc_meta in sub:
+                anchor = sc_text[:40].strip()
+                start = text.find(anchor, search_pos)
+                start = max(0, start)
+                end = start + len(sc_text)
+                search_pos = max(search_pos, start)
+                raw.append((sc_text, {
+                    "start_offset": start,
+                    "end_offset": end,
+                    "section_title": title,
+                }))
+
+    # Склейка слишком мелких секций
+    merged: List[tuple] = []
+    buf_text: Optional[str] = None
+    buf_meta: Optional[Dict] = None
+
+    for chunk_text, meta in raw:
+        if _count_tokens(chunk_text) < _MIN_SECTION_TOKENS:
+            if buf_text is None:
+                buf_text, buf_meta = chunk_text, dict(meta)
+            else:
+                buf_text += "\n\n" + chunk_text
+                buf_meta["end_offset"] = meta["end_offset"]
+        else:
+            if buf_text is not None:
+                chunk_text = buf_text + "\n\n" + chunk_text
+                meta = dict(meta)
+                meta["start_offset"] = buf_meta["start_offset"]
+                buf_text = buf_meta = None
+            merged.append((chunk_text, meta))
+
+    if buf_text is not None:
+        if merged:
+            last_text, last_meta = merged[-1]
+            merged[-1] = (last_text + "\n\n" + buf_text, {
+                **last_meta,
+                "end_offset": buf_meta["end_offset"],
+            })
+        else:
+            merged.append((buf_text, buf_meta))
+
+    return merged if merged else _chunk_recursive(text, chunk_size)
+
+
+# ---------------------------------------------------------------------------
+# SmartChunker — публичный класс
+# ---------------------------------------------------------------------------
+
+class SmartChunker:
+    """
+    Умный чанкер: автоматически выбирает метод нарезки
+    по типу документа и его структуре.
+
+    Параметры:
+        chunk_size    — целевой размер чанка в токенах (default: 512)
+        min_tokens    — минимум токенов в чанке (default: 50)
+        overlap_tokens— перекрытие при M4 (default: 32)
+    """
+
     def __init__(
         self,
-        embedder=None,
-        t_sim: float = 0.5,
-        max_tokens: int = 512,
-        min_tokens: int = 30,
-        window_size: int = 2,
+        chunk_size: int = 512,
+        min_tokens: int = 50,
+        overlap_tokens: int = 32,
     ):
-        self.embedder = embedder
-        self.t_sim = t_sim
-        self.max_tokens = max_tokens
+        self.chunk_size = chunk_size
         self.min_tokens = min_tokens
-        self.window_size = window_size
+        self.overlap_tokens = overlap_tokens
 
     async def create_chunks(
         self,
         text: str,
         doc_title: str,
+        doc_type: str = "txt",
+        sections: Optional[List[Dict]] = None,
         topic_breadcrumb: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Вход: текст, заголовок, хлебные крошки.
-        Выход: список чанков с метаданными и офсетами.
+        Нарезает текст на чанки с метаданными.
+
+        Аргументы:
+            text            — извлечённый текст документа
+            doc_title       — название документа
+            doc_type        — "pdf" | "docx" | "txt" (определяет стратегию)
+            sections        — список секций [{title, text}] из парсера
+            topic_breadcrumb— категория/тема для header injection
+
+        Возвращает:
+            List[{"text": str, "meta": {...}}]
         """
         if not text or not text.strip():
-            logger.warning(f"Пустой текст для документа '{doc_title}', пропускаем.")
+            logger.warning(f"Пустой текст для '{doc_title}', пропускаем.")
             return []
 
-        sentences = _split_sentences(text)
-        if not sentences:
-            sentences = [text.strip()]
+        # --- Выбор метода ---
+        has_structure = bool(sections)
 
-        # Основной выбор алгоритма
-        if len(sentences) <= 3 or self.embedder is None:
-            # Передаем исходный текст для расчета офсетов
-            raw_chunks = self._simple_fallback(text, sentences)
-        else:
-            raw_chunks = self._semantic_split(text, sentences)
+        if doc_type == "pdf":
+            if has_structure:
+                method = "M5_Structure"
+                raw = _chunk_by_structure(text, sections, self.chunk_size)
+            else:
+                method = "M4_Recursive"
+                raw = _chunk_recursive(text, self.chunk_size, self.overlap_tokens)
 
-        result = []
-        for idx, (chunk_text, meta) in enumerate(raw_chunks):
-            # Header Injection (Requirement 4)
-            header = self._build_header(doc_title, topic_breadcrumb)
+        elif doc_type == "docx":
+            if has_structure:
+                method = "M5_Structure"
+                raw = _chunk_by_structure(text, sections, self.chunk_size)
+            else:
+                method = "M2_Sentence"
+                raw = _chunk_by_sentences(text, self.chunk_size, self.min_tokens)
+
+        else:  # txt, html, unknown
+            method = "M2_Sentence"
+            raw = _chunk_by_sentences(text, self.chunk_size, self.min_tokens)
+
+        # --- Сборка результата ---
+        result: List[Dict] = []
+        header = _build_header(doc_title, topic_breadcrumb)
+
+        for idx, (chunk_text, meta) in enumerate(raw):
             final_text = f"{header}\n{chunk_text}"
-
-            # Попытка извлечь заголовок секции (для section_path)
-            # Берем первое предложение чанка, если оно похоже на заголовок (короткое)
-            first_sent = chunk_text.split('\n')[0]
-            section = first_sent[:100] if len(first_sent) < 120 else None
-
+            first_line = chunk_text.split("\n")[0]
+            section_path = (
+                meta.get("section_title")
+                or (first_line[:100] if len(first_line) < 120 else None)
+            )
             meta.update({
                 "chunk_index": idx,
-                "token_count": _token_count(final_text),
+                "token_count": _count_tokens(final_text),
                 "doc_title": doc_title,
+                "doc_type": doc_type,
                 "topic_breadcrumb": topic_breadcrumb,
-                "section_path": section
+                "section_path": section_path,
+                "chunk_method": method,
             })
             result.append({"text": final_text, "meta": meta})
 
         logger.info(
-            f"✂️  Документ '{doc_title}': {len(sentences)} предложений → {len(result)} чанков"
-            + (" (semantic)" if self.embedder else " (fallback)")
+            f"✂️  '{doc_title}' [{doc_type}] → {len(result)} чанков ({method})"
         )
         return result
-
-    # ------------------------------------------------------------------
-    # Семантическое разбиение
-    # ------------------------------------------------------------------
-
-    def _semantic_split(self, full_text: str, sentences: List[str]) -> List[tuple]:
-        # --- 1. Буферы ---
-        buffers = []
-        for i, _ in enumerate(sentences):
-            start = max(0, i - self.window_size)
-            end = min(len(sentences), i + self.window_size + 1)
-            buffers.append(" ".join(sentences[start:end]))
-
-        # --- 2. Векторизация ---
-        try:
-            embeddings = self.embedder.encode(buffers, show_progress_bar=False)
-        except Exception as e:
-            logger.error(f"Ошибка векторизации: {e}. Используем fallback.")
-            return self._simple_fallback(full_text, sentences)
-
-        # --- 3. Точки разрыва по сходству ---
-        boundaries = set()
-        for i in range(len(embeddings) - 1):
-            sim = _cosine_similarity(embeddings[i], embeddings[i + 1])
-            if sim < self.t_sim:
-                boundaries.add(i + 1)
-
-        # --- 4. Дополнительные разрывы по max_tokens ---
-        boundaries = self._add_token_boundaries(sentences, boundaries)
-
-        # --- 5. Сборка чанков (ТЕПЕРЬ С ОФСЕТАМИ) ---
-        raw_chunks = self._assemble_chunks(full_text, sentences, boundaries)
-
-        # --- 6. Склейка мелких чанков ---
-        raw_chunks = self._merge_small_chunks(raw_chunks)
-
-        return raw_chunks
-
-    def _add_token_boundaries(self, sentences: List[str], boundaries: set) -> set:
-        result = set(boundaries)
-        current_tokens = 0
-        current_start = 0
-        for i, sent in enumerate(sentences):
-            current_tokens += _token_count(sent)
-            if current_tokens >= self.max_tokens and i > current_start:
-                result.add(i + 1)
-                current_tokens = 0
-                current_start = i + 1
-        return result
-
-    def _assemble_chunks(self, full_text: str, sentences: List[str], boundaries: set) -> List[tuple]:
-        """
-        Собирает предложения в чанки и вычисляет офсеты (Requirement 10).
-        """
-        chunks = []
-        current_sentences = []
-        start_sentence_idx = 0
-
-        # Мы отслеживаем текущую позицию поиска в тексте, чтобы не найти одинаковые предложения в разных местах
-        search_pos = 0
-
-        for i, sent in enumerate(sentences):
-            if i in boundaries and current_sentences:
-                chunk_body = " ".join(current_sentences)
-
-                # Находим точные границы текста
-                start_off = full_text.find(current_sentences[0], search_pos)
-                last_sent = current_sentences[-1]
-                end_off = full_text.find(last_sent, start_off) + len(last_sent)
-
-                # Обновляем позицию поиска, чтобы следующий чанк искался после этого
-                search_pos = start_off
-
-                chunks.append((chunk_body, {
-                    "start_offset": max(0, start_off),
-                    "end_offset": end_off,
-                    "start_sentence": start_sentence_idx,
-                    "end_sentence": i - 1
-                }))
-                current_sentences = []
-                start_sentence_idx = i
-
-            current_sentences.append(sent)
-
-        # Обработка последнего чанка
-        if current_sentences:
-            chunk_body = " ".join(current_sentences)
-            start_off = full_text.find(current_sentences[0], search_pos)
-            last_sent = current_sentences[-1]
-            end_off = full_text.find(last_sent, start_off) + len(last_sent)
-            chunks.append((chunk_body, {
-                "start_offset": max(0, start_off),
-                "end_offset": end_off,
-                "start_sentence": start_sentence_idx,
-                "end_sentence": len(sentences) - 1
-            }))
-        return chunks
-
-    def _merge_small_chunks(self, chunks: List[tuple]) -> List[tuple]:
-        if not chunks: return chunks
-        merged = []
-        i = 0
-        while i < len(chunks):
-            text, meta = chunks[i]
-            if _token_count(text) < self.min_tokens and i + 1 < len(chunks):
-                next_text, next_meta = chunks[i + 1]
-                combined_text = text + " " + next_text
-                combined_meta = {
-                    "start_offset": meta["start_offset"],
-                    "end_offset": next_meta["end_offset"],
-                    "start_sentence": meta["start_sentence"],
-                    "end_sentence": next_meta["end_sentence"],
-                }
-                chunks[i + 1] = (combined_text, combined_meta)
-                i += 1
-                continue
-            merged.append((text, meta))
-            i += 1
-        return merged
-
-    # ------------------------------------------------------------------
-    # Fallback
-    # ------------------------------------------------------------------
-
-    def _simple_fallback(self, full_text: str, sentences: List[str]) -> List[tuple]:
-        """Простая нарезка с сохранением офсетов."""
-        boundaries = set()
-        current_tokens = 0
-        for i, sent in enumerate(sentences):
-            t = _token_count(sent)
-            if current_tokens + t > self.max_tokens:
-                boundaries.add(i)
-                current_tokens = 0
-            current_tokens += t
-
-        return self._assemble_chunks(full_text, sentences, boundaries)
-
-    # ------------------------------------------------------------------
-    # Header Injection
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_header(doc_title: str, breadcrumb: Optional[str]) -> str:
-        lines = [f"Документ: {doc_title}"]
-        if breadcrumb:
-            lines.append(f"Категория: {breadcrumb}")
-        lines.append("---")
-        return "\n".join(lines)
