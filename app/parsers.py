@@ -18,6 +18,7 @@ sections — список структурных секций вида:
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 from typing import List, Dict, Tuple, Optional
@@ -31,9 +32,15 @@ from docx import Document as DocxReader
 # Параметры S3 / MinIO
 # ---------------------------------------------------------------------------
 
+# Имена переменных здесь S3_*, тогда как остальные сервисы читают MINIO_*. Значения в
+# compose отображаются одни в другие, но при запуске воркера вручную об этом легко забыть.
+# Умолчание localhost:9000 внутри контейнера указывает на него самого, и ошибка выглядит
+# как недоступный MinIO, а не как незаданная настройка, поэтому адрес пишем в лог при старте.
 S3_ENDPOINT  = os.getenv("S3_ENDPOINT",   "http://localhost:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
+
+logging.getLogger("IngestWorker").info("Хранилище документов: %s", S3_ENDPOINT)
 
 
 # ---------------------------------------------------------------------------

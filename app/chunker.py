@@ -23,6 +23,7 @@ chunker.py — SmartChunker для ingest_worker
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import List, Dict, Optional
 
@@ -32,15 +33,62 @@ logger = logging.getLogger("SmartChunker")
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+# Сколько символов приходится на один токен эмбеддера. Замеряно на корпусе проекта
+# (русскоязычные регламенты НИУ ВШЭ) токенизатором BAAI/bge-m3: в среднем 4.53, медиана 4.75,
+# на плотном тексте — таблицы, перечни, юридические формулировки — до 2.26. Берём 4.0, то есть
+# чуть консервативнее среднего: чанки выходят немного меньше цели, а не больше неё.
+#
+# Прежняя оценка `слова × 1.3` рассчитана на английский и на русском занижала вдвое, а с
+# прежней англоязычной моделью — в 5.8 раза: её словарь BERT почти не содержал русских
+# подслов и дробил слова на отдельные буквы. Чанки выходили по 5854 символа при окне модели
+# в 512 токенов, и sentence-transformers молча обрезал вход, не поднимая ошибки.
+#
+# Значение зависит от модели: при смене EMBEDDER_MODEL_NAME его нужно перемерить.
+CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "4.0"))
+
+
 def _count_tokens(text: str) -> int:
-    """Быстрая оценка числа токенов (слова × 1.3)."""
-    return max(1, int(len(text.split()) * 1.3))
+    """Оценка числа токенов по длине текста в символах.
+
+    По символам, а не по словам: длинные слова, таблицы и текст без пробелов оценка по
+    словам занижает особенно сильно, а разброс символов на токен заметно уже.
+    """
+    return max(1, round(len(text) / CHARS_PER_TOKEN))
 
 
 def _split_sentences(text: str) -> List[str]:
     """Разбивка текста на предложения."""
     raw = re.split(r"(?<=[.!?])\s+|\n{2,}", text)
     return [s.strip() for s in raw if len(s.split()) >= 3]
+
+
+def _split_oversized(piece: str, chunk_size: int) -> List[str]:
+    """Режет кусок, который сам по себе длиннее целевого размера, по словам.
+
+    Нужен потому, что группировка по предложениям умеет ставить границу только МЕЖДУ
+    предложениями. Если `_split_sentences` не нашла границ вообще (текст без точек —
+    таблицы, перечни, выгрузки страниц) или одно предложение оказалось длиннее цели,
+    кусок уходил в чанк целиком: так появлялись чанки по 19 500 символов, на которых
+    embedding-svc отвечал 413.
+    """
+    if _count_tokens(piece) <= chunk_size:
+        return [piece]
+
+    words = piece.split()
+    if not words:
+        return [piece]
+
+    # Слов на чанк — из той же калибровки: chunk_size токенов при CHARS_PER_TOKEN символов
+    # на токен, делённые на среднюю длину слова в этом куске.
+    avg_word_len = max(1.0, len(piece) / len(words))
+    words_per_chunk = max(1, int(chunk_size * CHARS_PER_TOKEN / avg_word_len))
+
+    out: List[str] = []
+    for i in range(0, len(words), words_per_chunk):
+        part = " ".join(words[i : i + words_per_chunk]).strip()
+        if part:
+            out.append(part)
+    return out
 
 
 def _build_header(doc_title: str, breadcrumb: Optional[str]) -> str:
@@ -67,7 +115,13 @@ def _chunk_by_sentences(
     """
     sentences = _split_sentences(text)
     if not sentences:
-        return [(text.strip(), {"start_offset": 0, "end_offset": len(text)})]
+        # Границ предложений нет вовсе — режем по словам, иначе весь документ станет
+        # одним чанком независимо от его размера.
+        parts = _split_oversized(text.strip(), chunk_size)
+        return [(p, {"start_offset": 0, "end_offset": len(text)}) for p in parts]
+
+    # Предложение длиннее цели граница между предложениями не разобьёт — дробим заранее.
+    sentences = [p for sent in sentences for p in _split_oversized(sent, chunk_size)]
 
     chunks: List[tuple] = []
     current: List[str] = []

@@ -1,9 +1,13 @@
 import asyncio
+import time
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Optional
+
+import aiohttp
 
 from sqlalchemy import select, delete, text, ForeignKey, Text, Integer, DateTime, BigInteger, Boolean, Double
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -22,10 +26,27 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 DATABASE_URL  = os.environ["DATABASE_URL"]
-EMBEDDER_NAME = os.environ.get("EMBEDDER_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
 CHUNK_SIZE    = int(os.environ.get("CHUNK_SIZE", 512))
 CHUNK_MIN     = int(os.environ.get("CHUNK_MIN_TOKENS", 50))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP_TOKENS", 32))
+
+# Эмбеддинги считает ТОЛЬКО embedding-svc — единый источник на всю систему.
+# Имя модели здесь намеренно не задаётся: авторитетным является то, что вернул сервис,
+# иначе появляется второе место, объявляющее модель, и они расходятся.
+EMBEDDING_SVC_URL        = os.environ.get("EMBEDDING_SVC_URL", "http://embedding-svc:8000")
+EMBEDDING_DIM            = int(os.environ.get("EMBEDDING_DIM", 1024))
+EMBED_REQUEST_TIMEOUT    = int(os.environ.get("EMBED_REQUEST_TIMEOUT_SEC", 120))
+# Размер батча при обращении к embedding-svc. Должен быть заведомо меньше лимита на
+# стороне сервиса: документ может дать сотни чанков, и отправлять их одним запросом
+# значит рисковать памятью общего для всей системы сервиса эмбеддингов.
+EMBED_BATCH_SIZE         = int(os.environ.get("EMBED_BATCH_SIZE", 64))
+EMBED_STARTUP_RETRIES    = int(os.environ.get("EMBED_STARTUP_RETRIES", 30))
+EMBED_STARTUP_RETRY_WAIT = int(os.environ.get("EMBED_STARTUP_RETRY_WAIT_SEC", 5))
+
+SERVICE_NAME                 = os.environ.get("SERVICE_NAME", "ingest-worker")
+SERVICE_TOKEN                = os.environ.get("SERVICE_TOKEN", "")
+INTERNAL_AUTH_HEADER_NAME    = os.environ.get("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
+INTERNAL_SERVICE_NAME_HEADER = os.environ.get("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -173,25 +194,16 @@ class ChunkEmbedding(Base):
         ForeignKey("library.chunks.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    embedding: Mapped[list] = mapped_column(Vector(1536))
+    embedding: Mapped[list] = mapped_column(Vector(EMBEDDING_DIM))
     embedding_model: Mapped[str] = mapped_column(Text)
 
 
 # ---------------------------------------------------------------------------
-# Сервисы (движок БД, embedder, chunker)
+# Сервисы (движок БД, chunker) — эмбеддинги считает embedding-svc, см. _embed()
 # ---------------------------------------------------------------------------
 
 engine = create_async_engine(DATABASE_URL)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# Embedder
-try:
-    from sentence_transformers import SentenceTransformer
-    embedder = SentenceTransformer(EMBEDDER_NAME)
-    logger.info(f"Модель {EMBEDDER_NAME} загружена")
-except Exception as e:
-    logger.error(f"Ошибка загрузки embedder: {e}")
-    embedder = None
 
 # SmartChunker — выбирает метод автоматически по типу файла
 chunker = SmartChunker(
@@ -201,18 +213,155 @@ chunker = SmartChunker(
 )
 
 
-def _embed(texts: list) -> list:
-    """Генерация эмбеддингов с дополнением до 1536 измерений."""
-    if not embedder:
-        return [[0.0] * 1536 for _ in texts]
-    vectors = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    result = []
-    for v in vectors:
-        v_list = v.tolist()
-        if len(v_list) < 1536:
-            v_list += [0.0] * (1536 - len(v_list))
-        result.append(v_list[:1536])
-    return result
+def _internal_auth_headers() -> dict:
+    return {
+        INTERNAL_SERVICE_NAME_HEADER: SERVICE_NAME,
+        INTERNAL_AUTH_HEADER_NAME: SERVICE_TOKEN,
+    }
+
+
+async def _embed_batch(session: aiohttp.ClientSession, texts: list) -> tuple:
+    """Один запрос к embedding-svc. Возвращает (векторы, имя модели)."""
+    async with session.post(
+        f"{EMBEDDING_SVC_URL.rstrip('/')}/embed",
+        json={"texts": texts, "normalize": True},
+        headers=_internal_auth_headers(),
+    ) as response:
+        response.raise_for_status()
+        data = await response.json()
+
+    vectors = data["embeddings"]
+    dimension = data.get("dimension") or (len(vectors[0]) if vectors else 0)
+    if dimension != EMBEDDING_DIM:
+        raise RuntimeError(
+            f"embedding-svc вернул векторы размерности {dimension}, "
+            f"а ожидается {EMBEDDING_DIM} (EMBEDDING_DIM)"
+        )
+    if len(vectors) != len(texts):
+        raise RuntimeError(
+            f"embedding-svc вернул {len(vectors)} векторов на {len(texts)} текстов"
+        )
+    return vectors, data["model"]
+
+
+async def _embed(texts: list) -> tuple:
+    """Считает эмбеддинги через embedding-svc. Возвращает (векторы, имя модели).
+
+    Отправка идёт батчами по EMBED_BATCH_SIZE: у документа могут быть сотни чанков, а
+    embedding-svc — общий для всей системы, и один огромный запрос способен исчерпать его
+    память, остановив заодно и поиск.
+
+    Ни дополнения нулями, ни обрезки: несовпадение размерности — это ошибка конфигурации,
+    а не повод подгонять данные. Прежняя версия грузила собственный SentenceTransformer и
+    подгоняла всё под 1536 измерений, из-за чего вставка в колонку VECTOR(1024) падала и
+    откатывала документ целиком вместе с чанками.
+    """
+    if not texts:
+        return [], ""
+
+    vectors: list = []
+    model_name = ""
+    timeout = aiohttp.ClientTimeout(total=EMBED_REQUEST_TIMEOUT)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[start : start + EMBED_BATCH_SIZE]
+            batch_vectors, batch_model = await _embed_batch(session, batch)
+
+            # Модель не должна смениться посреди документа: иначе часть чанков окажется
+            # в одном векторном пространстве, часть — в другом, и поиск станет молча врать.
+            if model_name and batch_model != model_name:
+                raise RuntimeError(
+                    f"embedding-svc сменил модель посреди документа: "
+                    f"было '{model_name}', стало '{batch_model}'"
+                )
+            model_name = batch_model
+            vectors.extend(batch_vectors)
+
+    return vectors, model_name
+
+
+async def _column_dimension(schema_table: str, column: str) -> Optional[int]:
+    """Фактическая размерность pgvector-колонки в БД (None — если не задана)."""
+    async with async_session() as session:
+        declared = (
+            await session.execute(
+                text(
+                    # to_regclass(:rel), а не :rel::regclass — SQLAlchemy не распознаёт
+                    # параметр, за которым сразу идёт `::`, и принимает его за оператор
+                    # приведения типа: `:rel` уходил в Postgres буквально и валил запрос.
+                    # Побочный плюс: для несуществующей таблицы функция вернёт NULL,
+                    # а приведение бросало бы исключение.
+                    "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                    "WHERE attrelid = to_regclass(:rel) AND attname = :col AND NOT attisdropped"
+                ),
+                {"rel": schema_table, "col": column},
+            )
+        ).scalar()
+
+    if not declared:
+        return None
+    match = re.search(r"\((\d+)\)", declared)
+    return int(match.group(1)) if match else None
+
+
+async def verify_embedding_setup() -> None:
+    """Сверяет «модель ↔ колонка БД» ДО начала обработки документов.
+
+    Раньше расхождение размерности обнаруживалось только в момент вставки — и, поскольку
+    чанки и эмбеддинги пишутся одной транзакцией, откатывало документ целиком, помечая его
+    как failed. Теперь воркер просто не стартует и пишет, что именно с чем разошлось.
+
+    embedding-svc грузит модель не мгновенно, поэтому проверка повторяется с паузой, а не
+    падает на первой же неудаче.
+    """
+    info = None
+    last_error = None
+    for attempt in range(1, EMBED_STARTUP_RETRIES + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=EMBED_REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{EMBEDDING_SVC_URL.rstrip('/')}/ping") as response:
+                    response.raise_for_status()
+                    info = await response.json()
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.info(
+                f"Ожидаем embedding-svc ({attempt}/{EMBED_STARTUP_RETRIES}): {exc}"
+            )
+            await asyncio.sleep(EMBED_STARTUP_RETRY_WAIT)
+
+    if info is None:
+        raise RuntimeError(
+            f"embedding-svc недоступен по адресу {EMBEDDING_SVC_URL}: {last_error}"
+        )
+
+    service_dim = info.get("dimension")
+    if service_dim != EMBEDDING_DIM:
+        raise RuntimeError(
+            f"Модель '{info.get('model')}' в embedding-svc даёт {service_dim} измерений, "
+            f"а EMBEDDING_DIM={EMBEDDING_DIM}. Смена модели эмбеддингов требует пересчёта "
+            f"всех чанков и графа — см. README graph-rag-svc, §13.1."
+        )
+
+    column_dim = await _column_dimension("library.chunk_embeddings", "embedding")
+    if column_dim is None:
+        raise RuntimeError(
+            "Не удалось определить размерность library.chunk_embeddings.embedding: таблицы "
+            "или колонки нет, либо тип объявлен без размера. Примените схему БД перед запуском."
+        )
+    if column_dim != EMBEDDING_DIM:
+        raise RuntimeError(
+            f"Колонка library.chunk_embeddings.embedding объявлена как VECTOR({column_dim}), "
+            f"а EMBEDDING_DIM={EMBEDDING_DIM}. Приведите схему БД и конфигурацию к одному "
+            f"значению перед запуском."
+        )
+
+    logger.info(
+        f"Эмбеддинги: модель '{info.get('model')}', {EMBEDDING_DIM} измерений — "
+        f"согласовано с library.chunk_embeddings"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +436,7 @@ async def process_one_document() -> bool:
             await session.execute(delete(Chunk).where(Chunk.document_id == doc_id))
 
             if chunks_list:
-                embeddings = _embed([c["text"] for c in chunks_list])
+                embeddings, embedding_model = await _embed([c["text"] for c in chunks_list])
                 logger.info(f"Создано чанков: {len(chunks_list)}")
 
                 for i, (c_data, v) in enumerate(zip(chunks_list, embeddings)):
@@ -307,7 +456,7 @@ async def process_one_document() -> bool:
                     session.add(ChunkEmbedding(
                         chunk_id=new_chunk.id,
                         embedding=v,
-                        embedding_model=EMBEDDER_NAME,
+                        embedding_model=embedding_model,
                     ))
 
             # 7. Финализация
@@ -345,12 +494,44 @@ async def process_one_document() -> bool:
 # ---------------------------------------------------------------------------
 
 async def main():
-    logger.info("IngestWorker запущен, ожидаем задачи...")
+    logger.info("IngestWorker запущен, проверяем конфигурацию эмбеддингов...")
+    await verify_embedding_setup()
+    logger.info("Ожидаем задачи...")
+
+    # Отчёт о завершении прохода. Раньше строка «Ожидаем задачи...» печаталась только один
+    # раз, до цикла, а опустевшую очередь воркер встречал молчанием: лог просто обрывался на
+    # последнем документе. По нему нельзя было отличить «всё обработано» от «завис», из-за
+    # чего приходилось лезть в базу и считать статусы руками.
+    #
+    # Пишем ровно на переходе «работал → очередь пуста», а не каждые 5 секунд: иначе простой
+    # засыпал бы лог одинаковыми строками.
+    batch_processed = 0
+    batch_started: float | None = None
+
     while True:
         try:
+            # Засечка берётся ДО обработки: иначе отсчёт начинался бы уже после первого
+            # документа и проход из одного документа всегда показывал бы 0.0 с.
+            tick = time.monotonic()
             processed = await process_one_document()
-            if not processed:
-                await asyncio.sleep(5)
+            if processed:
+                if batch_started is None:
+                    batch_started = tick
+                batch_processed += 1
+                continue
+
+            if batch_processed:
+                elapsed = time.monotonic() - (batch_started or time.monotonic())
+                logger.info(
+                    "Очередь пуста: обработано документов за проход — %d, заняло %.1f с. "
+                    "Ожидаем задачи...",
+                    batch_processed,
+                    elapsed,
+                )
+                batch_processed = 0
+                batch_started = None
+
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Критический сбой цикла: {e}")
             await asyncio.sleep(5)
