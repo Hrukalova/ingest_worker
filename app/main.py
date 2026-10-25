@@ -2,7 +2,6 @@ import asyncio
 import time
 import logging
 import os
-import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +12,7 @@ import asyncpg
 
 from sqlalchemy import select, delete, text, func, or_, and_, ForeignKey, Text, Integer, DateTime, BigInteger, Boolean, Double
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, mapped_column, Mapped
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -318,27 +318,24 @@ async def _embed(texts: list) -> tuple:
 
 
 async def _column_dimension(schema_table: str, column: str) -> Optional[int]:
-    """Фактическая размерность pgvector-колонки в БД (None — если не задана)."""
-    async with async_session() as session:
-        declared = (
-            await session.execute(
-                text(
-                    # to_regclass(:rel), а не :rel::regclass — SQLAlchemy не распознаёт
-                    # параметр, за которым сразу идёт `::`, и принимает его за оператор
-                    # приведения типа: `:rel` уходил в Postgres буквально и валил запрос.
-                    # Побочный плюс: для несуществующей таблицы функция вернёт NULL,
-                    # а приведение бросало бы исключение.
-                    "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
-                    "WHERE attrelid = to_regclass(:rel) AND attname = :col AND NOT attisdropped"
-                ),
-                {"rel": schema_table, "col": column},
-            )
-        ).scalar()
+    """Фактическая размерность pgvector-колонки в БД (None — если не задана).
 
-    if not declared:
-        return None
-    match = re.search(r"\((\d+)\)", declared)
-    return int(match.group(1)) if match else None
+    Сам запрос живёт в БД (core.vector_column_dimension, migrations/007): ту же проверку делает
+    graph-rag-svc, и две копии в разных репозиториях уже успели разойтись.
+    """
+    try:
+        async with async_session() as session:
+            return (
+                await session.execute(
+                    text("SELECT core.vector_column_dimension(:rel, :col)"),
+                    {"rel": schema_table, "col": column},
+                )
+            ).scalar()
+    except ProgrammingError as exc:
+        raise RuntimeError(
+            "В БД нет функции core.vector_column_dimension(). Примените "
+            "main/infra/db/migrations/007_vector_column_dimension.sql."
+        ) from exc
 
 
 async def verify_embedding_setup() -> None:
