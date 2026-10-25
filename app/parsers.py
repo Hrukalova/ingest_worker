@@ -28,6 +28,8 @@ import aioboto3
 import fitz          # PyMuPDF
 from docx import Document as DocxReader
 
+from errors import DocumentParseError, FileTooLargeError
+
 # ---------------------------------------------------------------------------
 # Параметры S3 / MinIO
 # ---------------------------------------------------------------------------
@@ -41,6 +43,22 @@ S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 
 logging.getLogger("IngestWorker").info("Хранилище документов: %s", S3_ENDPOINT)
+
+# Предел размера исходного файла. Файл целиком читается в память и затем разбирается
+# (PyMuPDF держит в памяти ещё и собственное представление), поэтому без предела один
+# огромный файл способен уронить воркер по OOM — и каждый перезапуск снова брал бы его же.
+# Проверка идёт до загрузки, где размер известен заранее (S3, локальный файл, Content-Length),
+# и во время чтения — для HTTP-ответов без Content-Length или с неверным.
+MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MB * 1024 * 1024)
+
+
+def _check_size(size: Optional[int], source: str) -> None:
+    if size is not None and size > MAX_FILE_SIZE_BYTES:
+        raise FileTooLargeError(
+            f"Файл {source} весит {size / 1024 / 1024:.1f} МБ, "
+            f"предел — {MAX_FILE_SIZE_MB:g} МБ (MAX_FILE_SIZE_MB)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +76,11 @@ async def get_content_from_s3(bucket: str, key: str) -> bytes:
     ) as s3:
         try:
             response = await s3.get_object(Bucket=bucket, Key=key)
+            _check_size(response.get("ContentLength"), f"s3://{bucket}/{key}")
             async with response["Body"] as stream:
                 return await stream.read()
+        except FileTooLargeError:
+            raise
         except Exception as e:
             raise Exception(f"S3 download failed (bucket={bucket}, key={key}): {e}")
 
@@ -82,12 +103,18 @@ async def get_content(
                 path_or_url,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                raise Exception(f"HTTP {resp.status}: {path_or_url}")
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {path_or_url}")
+                _check_size(resp.content_length, path_or_url)
+                data = bytearray()
+                async for piece in resp.content.iter_chunked(1024 * 1024):
+                    data.extend(piece)
+                    _check_size(len(data), path_or_url)
+                return bytes(data)
 
     clean = path_or_url.strip()
     if os.path.exists(clean):
+        _check_size(os.path.getsize(clean), clean)
         with open(clean, "rb") as f:
             return f.read()
     raise FileNotFoundError(f"Файл не найден: {clean}")
@@ -138,7 +165,7 @@ def parse_pdf(file_bytes: bytes) -> Tuple[str, List[Dict]]:
         return full_text, sections
 
     except Exception as e:
-        raise Exception(f"PDF parse failed: {e}")
+        raise DocumentParseError(f"PDF parse failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +234,7 @@ def parse_docx(file_bytes: bytes) -> Tuple[str, List[Dict]]:
         return full_text, sections
 
     except Exception as e:
-        raise Exception(f"DOCX parse failed: {e}")
+        raise DocumentParseError(f"DOCX parse failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -223,4 +250,4 @@ def parse_txt(file_bytes: bytes) -> Tuple[str, List[Dict]]:
         text = file_bytes.decode("utf-8", errors="replace")
         return text, []
     except Exception as e:
-        raise Exception(f"TXT parse failed: {e}")
+        raise DocumentParseError(f"TXT parse failed: {e}") from e

@@ -4,18 +4,22 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import asyncpg
 
-from sqlalchemy import select, delete, text, ForeignKey, Text, Integer, DateTime, BigInteger, Boolean, Double
+from sqlalchemy import select, delete, text, func, or_, and_, ForeignKey, Text, Integer, DateTime, BigInteger, Boolean, Double
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, mapped_column, Mapped
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 
+from errors import PermanentIngestError
 from parsers import get_content, parse_pdf, parse_docx, parse_txt
 from chunker import SmartChunker
 
@@ -42,6 +46,34 @@ EMBED_REQUEST_TIMEOUT    = int(os.environ.get("EMBED_REQUEST_TIMEOUT_SEC", 120))
 EMBED_BATCH_SIZE         = int(os.environ.get("EMBED_BATCH_SIZE", 64))
 EMBED_STARTUP_RETRIES    = int(os.environ.get("EMBED_STARTUP_RETRIES", 30))
 EMBED_STARTUP_RETRY_WAIT = int(os.environ.get("EMBED_STARTUP_RETRY_WAIT_SEC", 5))
+
+# Повторы обработки документа. Ошибка, которая может пройти сама (недоступен
+# embedding-svc, MinIO, БД), возвращает документ в pending с отложенным временем следующей
+# попытки: пауза INGEST_RETRY_BASE_SEC удваивается с каждой попыткой до INGEST_RETRY_MAX_SEC.
+# После INGEST_MAX_ATTEMPTS попыток — failed. Ошибки, которые повтор не исправит
+# (PermanentIngestError: слишком большой или битый файл), дают failed сразу.
+INGEST_MAX_ATTEMPTS   = int(os.environ.get("INGEST_MAX_ATTEMPTS", 5))
+INGEST_RETRY_BASE_SEC = int(os.environ.get("INGEST_RETRY_BASE_SEC", 30))
+INGEST_RETRY_MAX_SEC  = int(os.environ.get("INGEST_RETRY_MAX_SEC", 3600))
+# Документ в processing дольше этого срока считается брошенным (воркер упал или был
+# перезапущен посреди обработки) и забирается снова — это тоже расходует попытку.
+# Должен быть заведомо больше времени обработки самого большого документа.
+INGEST_PROCESSING_TIMEOUT_SEC = int(os.environ.get("INGEST_PROCESSING_TIMEOUT_SEC", 1800))
+
+# Доставка задач. Новые задачи приходят через LISTEN/NOTIFY: триггер на library.documents
+# шлёт уведомление в канал INGEST_NOTIFY_CHANNEL, когда документ становится pending
+# (миграция 006_ingest_queue.sql). Опрос остаётся страховкой: раз в INGEST_POLL_FALLBACK_SEC
+# при работающем LISTEN и раз в INGEST_POLL_DEGRADED_SEC, если соединение для LISTEN потеряно.
+INGEST_NOTIFY_CHANNEL    = os.environ.get("INGEST_NOTIFY_CHANNEL", "ingest_jobs")
+INGEST_POLL_FALLBACK_SEC = int(os.environ.get("INGEST_POLL_FALLBACK_SEC", 60))
+INGEST_POLL_DEGRADED_SEC = int(os.environ.get("INGEST_POLL_DEGRADED_SEC", 5))
+
+# Healthcheck. HTTP-сервера у воркера нет, поэтому живость сообщается файлом: фоновая задача
+# обновляет его время изменения каждые HEARTBEAT_INTERVAL_SEC, а healthcheck в compose
+# проверяет, что файл свежий. Задача запускается только после стартовых проверок, так что
+# свежий файл значит «проверки пройдены и event loop не завис».
+HEARTBEAT_FILE         = os.environ.get("HEARTBEAT_FILE", "/tmp/ingest-worker.heartbeat")
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 10))
 
 SERVICE_NAME                 = os.environ.get("SERVICE_NAME", "ingest-worker")
 SERVICE_TOKEN                = os.environ.get("SERVICE_TOKEN", "")
@@ -107,6 +139,10 @@ class Document(Base):
     indexed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     checksum: Mapped[Optional[str]] = mapped_column(Text)
     content_version: Mapped[int] = mapped_column(Integer, default=1)
+    # Колонки очереди (миграция 006_ingest_queue.sql).
+    ingest_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    ingest_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ingest_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
 class DocumentFile(Base):
@@ -382,13 +418,77 @@ def _detect_doc_type(file_name: str, mime_type: str) -> str:
 # Основной pipeline обработки документа
 # ---------------------------------------------------------------------------
 
+_PARSERS = {"pdf": parse_pdf, "docx": parse_docx, "txt": parse_txt}
+
+
+def _claimable():
+    """Условие «документ можно брать в работу».
+
+    - pending, у которого наступило время попытки (NULL — новый документ, без задержки);
+    - processing, брошенный дольше INGEST_PROCESSING_TIMEOUT_SEC назад. Раньше документ,
+      на котором воркер упал или был перезапущен, навсегда оставался в processing: статус
+      коммитится до обработки, и повторно его никто не брал. NULL в ingest_started_at —
+      документы, застрявшие так до миграции 006.
+    """
+    now = func.now()
+    stale_before = now - func.make_interval(0, 0, 0, 0, 0, 0, INGEST_PROCESSING_TIMEOUT_SEC)
+    return or_(
+        and_(
+            Document.ingest_status == "pending",
+            or_(Document.ingest_next_attempt_at.is_(None), Document.ingest_next_attempt_at <= now),
+        ),
+        and_(
+            Document.ingest_status == "processing",
+            or_(Document.ingest_started_at.is_(None), Document.ingest_started_at < stale_before),
+        ),
+    )
+
+
+def _retry_delay_sec(attempt: int) -> int:
+    return min(INGEST_RETRY_BASE_SEC * 2 ** (attempt - 1), INGEST_RETRY_MAX_SEC)
+
+
+async def _record_failure(doc_id: uuid.UUID, attempt: int, exc: Exception) -> None:
+    """Пишет результат неудачной попытки: отложенный повтор либо окончательный failed.
+
+    Отдельной сессией: основная откатилась вместе с частично записанными чанками.
+    """
+    permanent = isinstance(exc, PermanentIngestError)
+    if permanent or attempt >= INGEST_MAX_ATTEMPTS:
+        status, next_at = "failed", None
+        err_text = str(exc) if permanent else f"Попытка {attempt}/{INGEST_MAX_ATTEMPTS}: {exc}"
+        logger.error(f"Ошибка на {doc_id}, документ помечен failed: {err_text}")
+    else:
+        delay = _retry_delay_sec(attempt)
+        status, next_at = "pending", datetime.now(timezone.utc) + timedelta(seconds=delay)
+        err_text = f"Попытка {attempt}/{INGEST_MAX_ATTEMPTS}: {exc}"
+        logger.warning(f"Ошибка на {doc_id}, повтор через {delay} с: {err_text}")
+
+    async with async_session() as err_session:
+        try:
+            await err_session.execute(
+                text("""
+                    UPDATE library.documents
+                    SET ingest_status          = :status,
+                        ingest_error           = :err,
+                        ingest_next_attempt_at = :next_at
+                    WHERE id = :id
+                """),
+                {"status": status, "err": err_text, "next_at": next_at, "id": doc_id},
+            )
+            await err_session.commit()
+        except Exception as db_err:
+            # Документ остаётся в processing и будет забран снова по INGEST_PROCESSING_TIMEOUT_SEC.
+            logger.error(f"Не удалось записать ошибку в БД: {db_err}")
+
+
 async def process_one_document() -> bool:
     async with async_session() as session:
         # 1. Выбираем задачу (SKIP LOCKED — параллельность без коллизий)
         query = (
             select(Document, DocumentFile)
             .join(DocumentFile, Document.id == DocumentFile.document_id)
-            .where(Document.ingest_status == "pending")
+            .where(_claimable())
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -399,15 +499,38 @@ async def process_one_document() -> bool:
 
         doc, df = result_row
         doc_id = doc.id
-        logger.info(f"Обработка: {doc.title}")
+
+        # Попытки кончились, а документ снова в очереди. Обычный путь сюда не ведёт: после
+        # последней неудачной попытки документ сразу получает failed. Попадает сюда брошенный
+        # processing — документ, на котором воркер падал целиком (например, по памяти) и не
+        # успевал записать ошибку. Без этой проверки такой документ валил бы воркер бесконечно.
+        if doc.ingest_attempts >= INGEST_MAX_ATTEMPTS:
+            if doc.ingest_status == "processing":
+                reason = (
+                    "обработка прерывалась без записи результата — вероятно, воркер падал "
+                    "на этом документе"
+                )
+            else:
+                reason = f"последняя ошибка: {doc.ingest_error}"
+            doc.ingest_status = "failed"
+            doc.ingest_next_attempt_at = None
+            doc.ingest_error = f"Исчерпано {doc.ingest_attempts} попыток обработки; {reason}"
+            await session.commit()
+            logger.error(f"{doc.title}: {doc.ingest_error}")
+            return True
+
+        attempt = doc.ingest_attempts + 1
+        logger.info(f"Обработка: {doc.title} (попытка {attempt}/{INGEST_MAX_ATTEMPTS})")
 
         try:
             # 2. Ставим статус "processing"
             doc.ingest_status = "processing"
+            doc.ingest_attempts = attempt
+            doc.ingest_started_at = func.now()
             await session.commit()
             await session.refresh(doc)
 
-            # 3. Загрузка файла
+            # 3. Загрузка файла (с проверкой MAX_FILE_SIZE_MB)
             content = await get_content(
                 df.storage_path,
                 df.storage_backend,
@@ -415,14 +538,11 @@ async def process_one_document() -> bool:
                 df.storage_key,
             )
 
-            # 4. Парсинг — все парсеры возвращают (text, sections)
+            # 4. Парсинг — все парсеры возвращают (text, sections). В отдельном потоке:
+            # разбор большого PDF занимает секунды, и всё это время event loop не обслуживал
+            # бы ни heartbeat, ни соединение LISTEN.
             doc_type = _detect_doc_type(df.file_name, df.mime_type)
-            if doc_type == "pdf":
-                text_data, sections = parse_pdf(content)
-            elif doc_type == "docx":
-                text_data, sections = parse_docx(content)
-            else:
-                text_data, sections = parse_txt(content)
+            text_data, sections = await asyncio.to_thread(_PARSERS[doc_type], content)
 
             # 5. Умная нарезка (метод выбирается автоматически)
             chunks_list = await chunker.create_chunks(
@@ -459,34 +579,111 @@ async def process_one_document() -> bool:
                         embedding_model=embedding_model,
                     ))
 
-            # 7. Финализация
+            # 7. Финализация. Счётчик попыток обнуляется: если документ позже вернут в
+            # pending (новая версия), у него снова будет полный запас попыток.
             doc.ingest_status = "indexed"
             doc.indexed_at = datetime.now()
             doc.ingest_error = None
+            doc.ingest_attempts = 0
+            doc.ingest_next_attempt_at = None
             await session.commit()
             logger.info(f"Готово: {doc.title}")
 
         except Exception as e:
             await session.rollback()
-            err_text = str(e)
-            logger.error(f"Ошибка на {doc_id}: {err_text}")
-
-            async with async_session() as err_session:
-                try:
-                    await err_session.execute(
-                        text("""
-                            UPDATE library.documents
-                            SET ingest_status = 'failed',
-                                ingest_error  = :err
-                            WHERE id = :id
-                        """),
-                        {"err": err_text, "id": doc_id},
-                    )
-                    await err_session.commit()
-                except Exception as db_err:
-                    logger.error(f"Не удалось записать ошибку в БД: {db_err}")
+            await _record_failure(doc_id, attempt, e)
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Доставка задач: LISTEN/NOTIFY + страховочный опрос
+# ---------------------------------------------------------------------------
+
+class JobSignal:
+    """Будит главный цикл по уведомлению из Postgres.
+
+    Раньше воркер опрашивал БД каждые 5 секунд: задержка до 5 с на каждый новый документ и
+    постоянные запросы в простое. Теперь триггер на library.documents шлёт NOTIFY, когда
+    документ становится pending, и воркер просыпается сразу. Отдельный брокер не нужен, и
+    сервисы, создающие документы (library-svc, db-svc, crawler-svc), менять не пришлось:
+    уведомление шлёт сама БД при любом способе записи.
+
+    LISTEN держится на отдельном соединении asyncpg — пул SQLAlchemy раздаёт соединения на
+    время транзакции и для подписки не подходит. Если соединение потеряно, воркер не падает,
+    а переходит на опрос раз в INGEST_POLL_DEGRADED_SEC и переподключается на каждом круге.
+    """
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._conn: Optional[asyncpg.Connection] = None
+        self._dsn = make_url(DATABASE_URL).set(drivername="postgresql").render_as_string(
+            hide_password=False
+        )
+        self._degraded_logged = False
+
+    @property
+    def connected(self) -> bool:
+        return self._conn is not None and not self._conn.is_closed()
+
+    async def connect(self) -> None:
+        if self.connected:
+            return
+        try:
+            self._conn = await asyncpg.connect(self._dsn)
+            await self._conn.add_listener(INGEST_NOTIFY_CHANNEL, self._on_notify)
+            # Обрыв соединения будит цикл сразу: он проверит очередь (уведомления за время
+            # обрыва потеряны) и переподключится, а не проспит до страховочного опроса.
+            self._conn.add_termination_listener(self._on_notify)
+            self._degraded_logged = False
+            logger.info(f"Подписка на уведомления о задачах: LISTEN {INGEST_NOTIFY_CHANNEL}")
+            # Пока подписки не было, уведомления терялись — проверяем очередь сразу.
+            self._event.set()
+        except Exception as exc:
+            self._conn = None
+            if not self._degraded_logged:
+                logger.warning(
+                    f"LISTEN {INGEST_NOTIFY_CHANNEL} недоступен, работаем опросом раз в "
+                    f"{INGEST_POLL_DEGRADED_SEC} с: {exc}"
+                )
+                self._degraded_logged = True
+
+    def _on_notify(self, *_args) -> None:
+        self._event.set()
+
+    async def wait(self, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._event.clear()
+
+
+async def _seconds_until_next_retry() -> Optional[float]:
+    """Через сколько секунд наступит ближайший отложенный повтор (None — таких нет).
+
+    NOTIFY приходит, когда документ становится pending, а не когда наступает время его
+    повтора, поэтому время пробуждения под повтор считает сам воркер.
+    """
+    async with async_session() as session:
+        return (
+            await session.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM min(ingest_next_attempt_at) - now()) "
+                    "FROM library.documents "
+                    "WHERE ingest_status = 'pending' AND ingest_next_attempt_at > now()"
+                )
+            )
+        ).scalar()
+
+
+async def _heartbeat() -> None:
+    while True:
+        try:
+            Path(HEARTBEAT_FILE).touch()
+        except OSError as exc:
+            logger.error(f"Не удалось обновить heartbeat-файл {HEARTBEAT_FILE}: {exc}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +691,16 @@ async def process_one_document() -> bool:
 # ---------------------------------------------------------------------------
 
 async def main():
+    # Файл от прошлого запуска контейнера (restart сохраняет файловую систему) не должен
+    # выдавать ещё не прошедший стартовые проверки воркер за здоровый.
+    Path(HEARTBEAT_FILE).unlink(missing_ok=True)
+
     logger.info("IngestWorker запущен, проверяем конфигурацию эмбеддингов...")
     await verify_embedding_setup()
+
+    signal = JobSignal()
+    await signal.connect()
+    heartbeat = asyncio.create_task(_heartbeat())  # noqa: F841 — держим ссылку, чтобы задачу не собрал GC
     logger.info("Ожидаем задачи...")
 
     # Отчёт о завершении прохода. Раньше строка «Ожидаем задачи...» печаталась только один
@@ -503,8 +708,8 @@ async def main():
     # последнем документе. По нему нельзя было отличить «всё обработано» от «завис», из-за
     # чего приходилось лезть в базу и считать статусы руками.
     #
-    # Пишем ровно на переходе «работал → очередь пуста», а не каждые 5 секунд: иначе простой
-    # засыпал бы лог одинаковыми строками.
+    # Пишем ровно на переходе «работал → очередь пуста», а не на каждом пробуждении: иначе
+    # простой засыпал бы лог одинаковыми строками.
     batch_processed = 0
     batch_started: float | None = None
 
@@ -531,10 +736,15 @@ async def main():
                 batch_processed = 0
                 batch_started = None
 
-            await asyncio.sleep(5)
+            await signal.connect()
+            timeout = INGEST_POLL_FALLBACK_SEC if signal.connected else INGEST_POLL_DEGRADED_SEC
+            retry_in = await _seconds_until_next_retry()
+            if retry_in is not None:
+                timeout = min(timeout, max(float(retry_in), 0.5))
+            await signal.wait(timeout)
         except Exception as e:
             logger.error(f"Критический сбой цикла: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(INGEST_POLL_DEGRADED_SEC)
 
 
 if __name__ == "__main__":

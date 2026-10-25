@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Это background worker, а не HTTP-сервис: порт не слушается, healthcheck'а нет.
+# Это background worker, а не HTTP-сервис: порт не слушается. Healthcheck — по
+# heartbeat-файлу, см. main/docker-compose.yml.
 # Запуск именно как `python app/main.py`, а не `-m app.main`: модули внутри app/
 # импортируют друг друга плоско (`from parsers import ...`), и такой запуск кладёт
 # каталог app/ в sys.path.
