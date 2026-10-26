@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from errors import PermanentIngestError
 from parsers import get_content, parse_pdf, parse_docx, parse_txt
 from chunker import SmartChunker
+from mtls import ssl_context as mtls_ssl_context
 from pg_tls import create_engine, ssl_context
 
 load_dotenv()
@@ -257,6 +258,16 @@ def _internal_auth_headers() -> dict:
     }
 
 
+def _mtls_session_kwargs() -> dict:
+    """Клиентский сертификат для вызовов embedding-svc (app/mtls.py); {} без mTLS.
+
+    Контекст собирается при создании каждой сессии, поэтому суточный сертификат, обновлённый
+    рядом лежащим контейнером, подхватывается без перезапуска воркера.
+    """
+    ctx = mtls_ssl_context()
+    return {"connector": aiohttp.TCPConnector(ssl=ctx)} if ctx is not None else {}
+
+
 async def _embed_batch(session: aiohttp.ClientSession, texts: list) -> tuple:
     """Один запрос к embedding-svc. Возвращает (векторы, имя модели)."""
     async with session.post(
@@ -300,7 +311,7 @@ async def _embed(texts: list) -> tuple:
     model_name = ""
     timeout = aiohttp.ClientTimeout(total=EMBED_REQUEST_TIMEOUT)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, **_mtls_session_kwargs()) as session:
         for start in range(0, len(texts), EMBED_BATCH_SIZE):
             batch = texts[start : start + EMBED_BATCH_SIZE]
             batch_vectors, batch_model = await _embed_batch(session, batch)
@@ -354,7 +365,7 @@ async def verify_embedding_setup() -> None:
     for attempt in range(1, EMBED_STARTUP_RETRIES + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=EMBED_REQUEST_TIMEOUT)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=timeout, **_mtls_session_kwargs()) as session:
                 async with session.get(f"{EMBEDDING_SVC_URL.rstrip('/')}/ping") as response:
                     response.raise_for_status()
                     info = await response.json()
