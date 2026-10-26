@@ -77,11 +77,6 @@ INGEST_POLL_DEGRADED_SEC = int(os.environ.get("INGEST_POLL_DEGRADED_SEC", 5))
 HEARTBEAT_FILE         = os.environ.get("HEARTBEAT_FILE", "/tmp/ingest-worker.heartbeat")
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 10))
 
-SERVICE_NAME                 = os.environ.get("SERVICE_NAME", "ingest-worker")
-SERVICE_TOKEN                = os.environ.get("SERVICE_TOKEN", "")
-INTERNAL_AUTH_HEADER_NAME    = os.environ.get("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
-INTERNAL_SERVICE_NAME_HEADER = os.environ.get("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -251,13 +246,6 @@ chunker = SmartChunker(
 )
 
 
-def _internal_auth_headers() -> dict:
-    return {
-        INTERNAL_SERVICE_NAME_HEADER: SERVICE_NAME,
-        INTERNAL_AUTH_HEADER_NAME: SERVICE_TOKEN,
-    }
-
-
 def _mtls_session_kwargs() -> dict:
     """Клиентский сертификат для вызовов embedding-svc (app/mtls.py); {} без mTLS.
 
@@ -273,7 +261,6 @@ async def _embed_batch(session: aiohttp.ClientSession, texts: list) -> tuple:
     async with session.post(
         f"{EMBEDDING_SVC_URL.rstrip('/')}/embed",
         json={"texts": texts, "normalize": True},
-        headers=_internal_auth_headers(),
     ) as response:
         response.raise_for_status()
         data = await response.json()
