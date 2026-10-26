@@ -169,8 +169,8 @@ docker-compose.yml
 | `CHUNK_MIN_TOKENS`     | `50`                                 | Минимум токенов (мелкие склеиваются) |
 | `CHUNK_OVERLAP_TOKENS` | `32`                                 | Перекрытие при M4 Recursive                            |
 | `S3_ENDPOINT`          | `http://localhost:9000`              | MinIO / S3 endpoint                                                 |
-| `S3_ACCESS_KEY`        | `minioadmin`                         | —                                                                  |
-| `S3_SECRET_KEY`        | `minioadmin`                         | —                                                                  |
+| `S3_ACCESS_KEY`        | — (обязателен)                       | —                                                                  |
+| `S3_SECRET_KEY`        | — (обязателен)                       | —                                                                  |
 
 ## Запуск
 

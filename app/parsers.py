@@ -25,9 +25,11 @@ from typing import List, Dict, Tuple, Optional
 
 import aiohttp
 import aioboto3
+from aiobotocore.config import AioConfig
 import fitz          # PyMuPDF
 from docx import Document as DocxReader
 
+import s3_tls
 from errors import DocumentParseError, FileTooLargeError
 
 # ---------------------------------------------------------------------------
@@ -39,8 +41,8 @@ from errors import DocumentParseError, FileTooLargeError
 # Умолчание localhost:9000 внутри контейнера указывает на него самого, и ошибка выглядит
 # как недоступный MinIO, а не как незаданная настройка, поэтому адрес пишем в лог при старте.
 S3_ENDPOINT  = os.getenv("S3_ENDPOINT",   "http://localhost:9000")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
 
 logging.getLogger("IngestWorker").info("Хранилище документов: %s", S3_ENDPOINT)
 
@@ -73,6 +75,8 @@ async def get_content_from_s3(bucket: str, key: str) -> bytes:
         endpoint_url=S3_ENDPOINT,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
+        verify=s3_tls.verify(),
+        config=AioConfig(client_cert=s3_tls.client_cert()),
     ) as s3:
         try:
             response = await s3.get_object(Bucket=bucket, Key=key)
