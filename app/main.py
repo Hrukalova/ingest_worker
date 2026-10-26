@@ -13,7 +13,7 @@ import asyncpg
 from sqlalchemy import select, delete, text, func, or_, and_, ForeignKey, Text, Integer, DateTime, BigInteger, Boolean, Double
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, mapped_column, Mapped
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from errors import PermanentIngestError
 from parsers import get_content, parse_pdf, parse_docx, parse_txt
 from chunker import SmartChunker
+from pg_tls import create_engine, ssl_context
 
 load_dotenv()
 
@@ -238,7 +239,7 @@ class ChunkEmbedding(Base):
 # Сервисы (движок БД, chunker) — эмбеддинги считает embedding-svc, см. _embed()
 # ---------------------------------------------------------------------------
 
-engine = create_async_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # SmartChunker — выбирает метод автоматически по типу файла
@@ -627,7 +628,8 @@ class JobSignal:
         if self.connected:
             return
         try:
-            self._conn = await asyncpg.connect(self._dsn)
+            # ssl_context() свежий на каждое подключение (см. app/pg_tls.py); None — как раньше.
+            self._conn = await asyncpg.connect(self._dsn, ssl=ssl_context())
             await self._conn.add_listener(INGEST_NOTIFY_CHANNEL, self._on_notify)
             # Обрыв соединения будит цикл сразу: он проверит очередь (уведомления за время
             # обрыва потеряны) и переподключится, а не проспит до страховочного опроса.
