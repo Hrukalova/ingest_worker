@@ -125,3 +125,29 @@ def test_unconfigured_raises(monkeypatch):
     monkeypatch.setattr(aux_index, "async_session", None)
     with pytest.raises(RuntimeError):
         asyncio.run(aux_index.embed_pending_links())
+
+
+def test_selection_excludes_blank_text():
+    # пустые тексты не выбираются вовсе: не эмбеддятся и не перевыбираются на каждом проходе
+    assert "btrim(coalesce(v.text, '')) <> ''" in str(aux_index.SELECT_VARIANTS)
+    assert "btrim(coalesce(description, '')) <> ''" in str(aux_index.SELECT_LINKS)
+
+
+@pytest.mark.parametrize("func", [aux_index.embed_pending_quick_answers, aux_index.embed_pending_links])
+def test_blank_rows_are_never_embedded(wired, func):
+    wired.session = FakeSession([("id-1", ""), ("id-2", "  \n"), ("id-3", None)])
+
+    assert asyncio.run(func()) == 0
+
+    assert wired.embed_calls == []
+    assert wired.session.updates == []
+
+
+def test_blank_rows_skipped_in_mixed_batch(wired):
+    wired.session = FakeSession([("id-1", " "), ("id-2", "текст")])
+
+    assert asyncio.run(aux_index.embed_pending_links()) == 1
+
+    assert wired.embed_calls == [["текст"]]
+    (_, params), = wired.session.updates
+    assert [p["id"] for p in params] == ["id-2"]

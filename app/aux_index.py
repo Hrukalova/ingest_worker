@@ -39,7 +39,7 @@ SELECT_VARIANTS = text("""
     SELECT v.id, v.text
     FROM library.quick_answer_variants v
     JOIN library.quick_answers qa ON qa.id = v.quick_answer_id
-    WHERE v.embedding IS NULL AND qa.is_active
+    WHERE v.embedding IS NULL AND qa.is_active AND btrim(coalesce(v.text, '')) <> ''
     ORDER BY v.id
     LIMIT :limit
     FOR UPDATE OF v SKIP LOCKED
@@ -47,7 +47,7 @@ SELECT_VARIANTS = text("""
 SELECT_LINKS = text("""
     SELECT id, description
     FROM library.links
-    WHERE embedding IS NULL AND is_active
+    WHERE embedding IS NULL AND is_active AND btrim(coalesce(description, '')) <> ''
     ORDER BY id
     LIMIT :limit
     FOR UPDATE SKIP LOCKED
@@ -71,6 +71,9 @@ async def _embed_pending(select, update, kind: str, limit: int) -> int:
 
     async with async_session() as session:
         rows = (await session.execute(select, {"limit": limit})).all()
+        # Пустые тексты отсеивает уже SQL (иначе они выбирались бы на каждом проходе); здесь
+        # страховка, чтобы пустая строка в любом случае не ушла в embedding-svc.
+        rows = [row for row in rows if row[1] and row[1].strip()]
         if not rows:
             return 0
 
