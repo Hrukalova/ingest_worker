@@ -129,8 +129,25 @@ def test_unconfigured_raises(monkeypatch):
 
 def test_selection_excludes_blank_text():
     # пустые тексты не выбираются вовсе: не эмбеддятся и не перевыбираются на каждом проходе
-    assert "btrim(coalesce(v.text, '')) <> ''" in str(aux_index.SELECT_VARIANTS)
-    assert "btrim(coalesce(description, '')) <> ''" in str(aux_index.SELECT_LINKS)
+    assert f"v.text ~ '{aux_index.NON_BLANK_CLASS}'" in str(aux_index.SELECT_VARIANTS)
+    assert f"description ~ '{aux_index.NON_BLANK_CLASS}'" in str(aux_index.SELECT_LINKS)
+
+
+def test_blank_definition_is_shared_by_sql_and_python():
+    # в SQL уходит ровно тот класс символов, по которому решает Python
+    assert aux_index.NON_BLANK_CLASS == r"[^ \t\n\r\f\v]"
+    assert r"~ '[^ \t\n\r\f\v]'" in str(aux_index.SELECT_VARIANTS)
+    assert r"~ '[^ \t\n\r\f\v]'" in str(aux_index.SELECT_LINKS)
+
+
+# Сверено с Postgres (pgvector:pg16, SELECT <строка> ~ '[^ \t\n\r\f\v]'): те же значения.
+@pytest.mark.parametrize("value, blank", [
+    (None, True), ("", True), (" ", True), ("\n", True), ("\t", True),
+    (" \n\t\r\f\v", True), ("a", False), (" a ", False),
+    ("\u00a0", False), ("\u2003", False),
+])
+def test_is_blank(value, blank):
+    assert aux_index._is_blank(value) is blank
 
 
 @pytest.mark.parametrize("func", [aux_index.embed_pending_quick_answers, aux_index.embed_pending_links])

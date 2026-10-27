@@ -14,6 +14,7 @@ configure().
 """
 
 import logging
+import re
 
 from sqlalchemy import text
 
@@ -33,21 +34,34 @@ def configure(embed, session_factory) -> None:
     async_session = session_factory
 
 
+# Единое определение «пустого» текста для SQL и Python: непустой — содержит хотя бы один символ
+# вне ASCII-пробельных ` \t\n\r\f\v` (NBSP и юникодные пробелы считаются непустыми с обеих
+# сторон). Строка попадает в SQL как есть: Postgres сам разворачивает \t, \n... в регулярном
+# выражении, поэтому экранировать их через E'' не нужно. Расхождение определений привело бы к
+# тому, что отброшенная Python строка выбиралась бы снова и блокировала очередь.
+NON_BLANK_CLASS = r"[^ \t\n\r\f\v]"
+_NON_BLANK_RE = re.compile(NON_BLANK_CLASS)
+
+
+def _is_blank(value) -> bool:
+    return value is None or _NON_BLANK_RE.search(value) is None
+
+
 # FOR UPDATE ... SKIP LOCKED: два воркера не берут одни и те же строки. У варианта признак
 # активности лежит в родительском быстром ответе.
-SELECT_VARIANTS = text("""
+SELECT_VARIANTS = text(f"""
     SELECT v.id, v.text
     FROM library.quick_answer_variants v
     JOIN library.quick_answers qa ON qa.id = v.quick_answer_id
-    WHERE v.embedding IS NULL AND qa.is_active AND btrim(coalesce(v.text, '')) <> ''
+    WHERE v.embedding IS NULL AND qa.is_active AND v.text ~ '{NON_BLANK_CLASS}'
     ORDER BY v.id
     LIMIT :limit
     FOR UPDATE OF v SKIP LOCKED
 """)
-SELECT_LINKS = text("""
+SELECT_LINKS = text(f"""
     SELECT id, description
     FROM library.links
-    WHERE embedding IS NULL AND is_active AND btrim(coalesce(description, '')) <> ''
+    WHERE embedding IS NULL AND is_active AND description ~ '{NON_BLANK_CLASS}'
     ORDER BY id
     LIMIT :limit
     FOR UPDATE SKIP LOCKED
@@ -71,9 +85,9 @@ async def _embed_pending(select, update, kind: str, limit: int) -> int:
 
     async with async_session() as session:
         rows = (await session.execute(select, {"limit": limit})).all()
-        # Пустые тексты отсеивает уже SQL (иначе они выбирались бы на каждом проходе); здесь
-        # страховка, чтобы пустая строка в любом случае не ушла в embedding-svc.
-        rows = [row for row in rows if row[1] and row[1].strip()]
+        # Пустые тексты отсеивает уже SQL с тем же определением (NON_BLANK_CLASS), так что здесь
+        # фильтр срабатывает лишь на случай расхождения: пустая строка не уйдёт в embedding-svc.
+        rows = [row for row in rows if not _is_blank(row[1])]
         if not rows:
             return 0
 
