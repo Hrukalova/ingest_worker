@@ -31,6 +31,11 @@ CHUNKS_CREATED = Counter(
     "pochemuchnik_ingest_chunks_created_total",
     "Чанки, записанные в library.chunks",
 )
+AUX_EMBEDDED = Counter(
+    "pochemuchnik_ingest_aux_embedded_total",
+    "Строки, получившие эмбеддинг вне документов",
+    ["kind"],  # quick_answer_variant | link
+)
 JOB_ERRORS = Counter(
     "pochemuchnik_ingest_job_errors_total",
     "Ошибки обработки по типу",

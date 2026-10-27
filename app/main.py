@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 
+import aux_index
 from errors import PermanentIngestError
 from notebook_chunker import build_document_chunks, embedding_text
 from notebook_parsing import extract_blocks
@@ -778,6 +779,8 @@ async def main():
     logger.info("IngestWorker запущен, проверяем конфигурацию эмбеддингов...")
     await verify_embedding_setup()
 
+    aux_index.configure(_embed, async_session)
+
     signal = JobSignal()
     await signal.connect()
     heartbeat = asyncio.create_task(_heartbeat())  # noqa: F841 — держим ссылку, чтобы задачу не собрал GC
@@ -791,6 +794,7 @@ async def main():
     # Пишем ровно на переходе «работал → очередь пуста», а не на каждом пробуждении: иначе
     # простой засыпал бы лог одинаковыми строками.
     batch_processed = 0
+    batch_aux = 0
     batch_started: float | None = None
 
     while True:
@@ -805,15 +809,27 @@ async def main():
                 batch_processed += 1
                 continue
 
-            if batch_processed:
+            # Документов нет — досчитываем быстрые ответы и ссылки. Пока они находятся,
+            # возвращаемся в начало цикла: новый документ не ждёт, а большой хвост разбирается
+            # порциями по limit строк.
+            aux = await aux_index.embed_pending_aux()
+            if aux:
+                if batch_started is None:
+                    batch_started = tick
+                batch_aux += aux
+                continue
+
+            if batch_processed or batch_aux:
                 elapsed = time.monotonic() - (batch_started or time.monotonic())
                 logger.info(
-                    "Очередь пуста: обработано документов за проход — %d, заняло %.1f с. "
-                    "Ожидаем задачи...",
+                    "Очередь пуста: обработано документов за проход — %d, быстрых ответов и "
+                    "ссылок — %d, заняло %.1f с. Ожидаем задачи...",
                     batch_processed,
+                    batch_aux,
                     elapsed,
                 )
                 batch_processed = 0
+                batch_aux = 0
                 batch_started = None
 
             await signal.connect()

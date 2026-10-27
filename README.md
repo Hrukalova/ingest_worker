@@ -284,5 +284,6 @@ graph-rag-svc и ingest-worker, менять его нужно во всех с�
 | `ingest_jobs_total{result}` | попытки обработки: `indexed`, `retry`, `failed` |
 | `ingest_job_duration_seconds{result}` | длительность попытки (`indexed`, `error`) |
 | `ingest_chunks_created_total` | чанки, записанные в `library.chunks` |
+| `ingest_aux_embedded_total{kind}` | строки, получившие эмбеддинг вне документов: `quick_answer_variant`, `link` |
 | `ingest_job_errors_total{type}` | ошибки: `FileTooLargeError`, `DocumentParseError`, `PermanentIngestError`, `transient` |
 
