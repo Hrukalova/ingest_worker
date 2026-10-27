@@ -20,8 +20,9 @@ from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 
 from errors import PermanentIngestError
-from parsers import get_content, parse_pdf, parse_docx, parse_txt
-from chunker import SmartChunker
+from notebook_chunker import build_document_chunks, embedding_text
+from notebook_parsing import extract_blocks
+from parsers import get_content
 from metrics import CHUNKS_CREATED, JOB_DURATION, JOB_ERRORS, JOBS, QUEUE_DEPTH, start_metrics_server
 from mtls import ssl_context as mtls_ssl_context
 from pg_tls import create_engine, ssl_context
@@ -33,9 +34,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 DATABASE_URL  = os.environ["DATABASE_URL"]
-CHUNK_SIZE    = int(os.environ.get("CHUNK_SIZE", 512))
-CHUNK_MIN     = int(os.environ.get("CHUNK_MIN_TOKENS", 50))
-CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP_TOKENS", 32))
 
 # Эмбеддинги считает ТОЛЬКО embedding-svc — единый источник на всю систему.
 # Имя модели здесь намеренно не задаётся: авторитетным является то, что вернул сервис,
@@ -132,6 +130,7 @@ class Document(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     topic_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     title: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(Text, nullable=False)
     ingest_status: Mapped[str] = mapped_column(Text, default="pending")
     ingest_error: Mapped[Optional[str]] = mapped_column(Text)
     indexed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -233,18 +232,11 @@ class ChunkEmbedding(Base):
 
 
 # ---------------------------------------------------------------------------
-# Сервисы (движок БД, chunker) — эмбеддинги считает embedding-svc, см. _embed()
+# Сервисы (движок БД) — эмбеддинги считает embedding-svc, см. _embed()
 # ---------------------------------------------------------------------------
 
 engine = create_engine(DATABASE_URL)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# SmartChunker — выбирает метод автоматически по типу файла
-chunker = SmartChunker(
-    chunk_size=CHUNK_SIZE,
-    min_tokens=CHUNK_MIN,
-    overlap_tokens=CHUNK_OVERLAP,
-)
 
 
 def _mtls_session_kwargs() -> dict:
@@ -261,7 +253,7 @@ async def _embed_batch(session: aiohttp.ClientSession, texts: list) -> tuple:
     """Один запрос к embedding-svc. Возвращает (векторы, имя модели)."""
     async with session.post(
         f"{EMBEDDING_SVC_URL.rstrip('/')}/embed",
-        json={"texts": texts, "normalize": True},
+        json={"texts": texts, "normalize": True, "kind": "passage"},
     ) as response:
         response.raise_for_status()
         data = await response.json()
@@ -415,7 +407,23 @@ def _detect_doc_type(file_name: str, mime_type: str) -> str:
 # Основной pipeline обработки документа
 # ---------------------------------------------------------------------------
 
-_PARSERS = {"pdf": parse_pdf, "docx": parse_docx, "txt": parse_txt}
+def chunk_rows(chunks: list) -> list:
+    """Поля строк library.chunks для чанков из build_document_chunks.
+
+    token_count — число слов; start/end_offset пусты (в пайплайне ноутбука смещений нет).
+    """
+    return [
+        {
+            "chunk_index": c["chunk_index"],
+            "text": c["text"],
+            "section_path": c["section"],
+            "start_offset": None,
+            "end_offset": None,
+            "token_count": len(c["text"].split()),
+            "metadata_json": {"kind": "notebook-v1"},
+        }
+        for c in chunks
+    ]
 
 
 def _claimable():
@@ -540,38 +548,27 @@ async def process_one_document() -> bool:
                 df.storage_key,
             )
 
-            # 4. Парсинг — все парсеры возвращают (text, sections). В отдельном потоке:
-            # разбор большого PDF занимает секунды, и всё это время event loop не обслуживал
-            # бы ни heartbeat, ни соединение LISTEN.
+            # 4. Парсинг в блоки. В отдельном потоке: разбор большого PDF занимает секунды,
+            # и всё это время event loop не обслуживал бы ни heartbeat, ни соединение LISTEN.
             doc_type = _detect_doc_type(df.file_name, df.mime_type)
-            text_data, sections = await asyncio.to_thread(_PARSERS[doc_type], content)
+            blocks = await asyncio.to_thread(extract_blocks, content, doc_type)
 
-            # 5. Умная нарезка (метод выбирается автоматически)
-            chunks_list = await chunker.create_chunks(
-                text=text_data,
-                doc_title=doc.title,
-                doc_type=doc_type,
-                sections=sections,
-            )
+            # 5. Нарезка по правилам пайплайна ноутбука
+            chunks_list = build_document_chunks(blocks)
 
             # 6. Удаляем старые чанки, пишем новые
             await session.execute(delete(Chunk).where(Chunk.document_id == doc_id))
 
             if chunks_list:
-                embeddings, embedding_model = await _embed([c["text"] for c in chunks_list])
+                # Префикс `passage: ` добавляет embedding-svc по полю kind
+                embeddings, embedding_model = await _embed([
+                    embedding_text(doc.title, doc.category, c["section"], c["text"])
+                    for c in chunks_list
+                ])
                 logger.info(f"Создано чанков: {len(chunks_list)}")
 
-                for i, (c_data, v) in enumerate(zip(chunks_list, embeddings)):
-                    new_chunk = Chunk(
-                        document_id=doc_id,
-                        chunk_index=i,
-                        text=c_data["text"],
-                        section_path=c_data["meta"].get("section_path"),
-                        start_offset=c_data["meta"].get("start_offset"),
-                        end_offset=c_data["meta"].get("end_offset"),
-                        token_count=c_data["meta"].get("token_count", 0),
-                        metadata_json=c_data["meta"],
-                    )
+                for row, v in zip(chunk_rows(chunks_list), embeddings):
+                    new_chunk = Chunk(document_id=doc_id, **row)
                     session.add(new_chunk)
                     await session.flush()
 

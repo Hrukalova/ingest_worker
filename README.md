@@ -56,9 +56,8 @@ PostgreSQL (library.documents)
         ▼
   IngestWorker (main.py)
         │
-        ├── parse_pdf   → SmartChunker (M5 или M4)
-        ├── parse_docx  → SmartChunker (M5 или M2)
-        └── parse_txt   → SmartChunker (M2)
+        ├── extract_blocks (PDF / DOCX / TXT → блоки раздела)
+        └── build_document_chunks (нарезка по пайплайну ноутбука)
         │
         ▼
   embedding-svc POST /embed   ← единственный источник векторов в системе
@@ -123,26 +122,13 @@ PostgreSQL (library.documents)
 сбрасывает ошибку и будит воркер через NOTIFY; если файл тот же и документ уже проиндексирован,
 повторной индексации нет.
 
-## Стратегия чанкинга (SmartChunker)
+## Парсинг и чанкинг (пайплайн ноутбука)
 
-Выбор метода производится автоматически на основе типа и структуры документа.
-Итоги внутреннего бенчмарка (метрика: **cohesion = intra_sim − inter_sim**):
+Логика перенесена из ноутбука команды (`MIEM_Last_Stable_Pipeline`) без изменений:
 
-| Формат | Условие                      | Метод                   | Cohesion     |
-| ------------ | ----------------------------------- | ---------------------------- | ------------ |
-| PDF          | есть оглавление (TOC) | **M5 Structure-aware** | лучший |
-| PDF          | нет оглавления         | **M4 Recursive**       | +0.007       |
-| DOCX         | есть Heading 1/2/3              | **M5 Structure-aware** | +0.035       |
-| DOCX         | нет заголовков         | **M2 Sentence**        | —           |
-| TXT          | всегда                        | **M2 Sentence**        | +0.047       |
-
-> HTML-страницы конвертируются в TXT во внешнем сервисе и поступают как `.txt`.
-
-### Методы чанкинга
-
-- **M2 Sentence** — разбивка по предложениям, группировка до `CHUNK_SIZE` токенов. Лучший cohesion на TXT.
-- **M4 Recursive** — рекурсивная нарезка по иерархии `\n\n → \n → ". " → " "` с перекрытием. Лучший для PDF без структуры.
-- **M5 Structure-aware** — нарезка по секциям из TOC (PDF) или Heading-стилей (DOCX). Секции > `CHUNK_SIZE` дробятся через M4.
+- **Блоки** (`notebook_parsing.extract_blocks`): DOCX — абзацы с заголовками по стилю `Heading`/«Заголов…» и строки таблиц вида `Заголовок: значение | …`; PDF — блок на страницу, раздел «Страница N» (`pypdf`); TXT — заголовки `#`. Текст чистится `clean_text` (markdown-ссылки, cookie-мусор, `\xa0`). Битый DOCX/PDF даёт `DocumentParseError` — документ сразу `failed`.
+- **Чанки** (`notebook_chunker.build_document_chunks`): абзацы одного раздела копятся до 1600 символов, длинный текст режется по предложениям (до 1400, слишком длинное предложение — жёстко); разные разделы не склеиваются; последний абзац длиной до 350 символов переходит в следующий чанк; чанки короче 80 символов отбрасываются.
+- **Текст для эмбеддинга** (`embedding_text`): `Название документа / Категория / Раздел / Текст`. Префикс `passage: ` добавляет `embedding-svc` по полю `kind` (воркер шлёт `"kind": "passage"`). Тот же формат использует BM25 в `graph-rag-svc`, менять его нельзя.
 
 ## Структура проекта
 
@@ -150,8 +136,9 @@ PostgreSQL (library.documents)
 app/
   main.py      — pipeline, модели БД, очередь (LISTEN/NOTIFY, повторы), heartbeat, главный цикл
   errors.py    — PermanentIngestError и наследники: ошибки, которые не повторяются
-  chunker.py   — SmartChunker (M2 / M4 / M5)
-  parsers.py   — parse_pdf, parse_docx, parse_txt
+  notebook_parsing.py — extract_blocks, clean_text (порт ячейки 9 ноутбука)
+  notebook_chunker.py — split_long_text, build_document_chunks, embedding_text (ячейка 11)
+  parsers.py   — загрузка файла (local, http, S3) с проверкой размера
 requirements.txt
 Dockerfile
 docker-compose.yml
@@ -176,9 +163,6 @@ docker-compose.yml
 | `INGEST_POLL_DEGRADED_SEC` | `5`                              | Опрос при потерянном соединении `LISTEN` |
 | `HEARTBEAT_FILE`       | `/tmp/ingest-worker.heartbeat`       | Файл для healthcheck |
 | `HEARTBEAT_INTERVAL_SEC` | `10`                               | Как часто обновлять heartbeat-файл |
-| `CHUNK_SIZE`           | `512`                                | Целевой размер чанка (токены)               |
-| `CHUNK_MIN_TOKENS`     | `50`                                 | Минимум токенов (мелкие склеиваются) |
-| `CHUNK_OVERLAP_TOKENS` | `32`                                 | Перекрытие при M4 Recursive                            |
 | `S3_ENDPOINT`          | `http://localhost:9000`              | MinIO / S3 endpoint                                                 |
 | `S3_ACCESS_KEY`        | — (обязателен)                       | —                                                                  |
 | `S3_SECRET_KEY`        | — (обязателен)                       | —                                                                  |
@@ -198,11 +182,11 @@ docker compose up --build
 
 `library.chunks`:
 
-- `text` — текст чанка с header injection (`Документ: ... / Категория: ... / ---`)
-- `section_path` — заголовок раздела (из TOC или Heading)
-- `start_offset` / `end_offset` — байтовые позиции в исходном тексте
-- `token_count` — оценочное число токенов
-- `metadata_json` — полный набор метаданных: `doc_type`, `chunk_method`, `chunk_index`, и др.
+- `text` — текст чанка как есть (заголовок документа добавляется только в текст для эмбеддинга)
+- `section_path` — раздел (заголовок DOCX/TXT или «Страница N» для PDF)
+- `start_offset` / `end_offset` — `NULL` (в пайплайне ноутбука смещений нет)
+- `token_count` — число слов в чанке
+- `metadata_json` — `{"kind": "notebook-v1"}`
 
 `library.chunk_embeddings`:
 

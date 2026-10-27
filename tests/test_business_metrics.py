@@ -57,7 +57,7 @@ class FakeSession:
 
 def make_doc(attempts=0):
     return SimpleNamespace(
-        id=uuid.uuid4(), title="ПУД", ingest_attempts=attempts, ingest_status="pending",
+        id=uuid.uuid4(), title="ПУД", category="Положения", ingest_attempts=attempts, ingest_status="pending",
         ingest_error=None, ingest_next_attempt_at=None, ingest_started_at=None, indexed_at=None,
     )
 
@@ -73,9 +73,6 @@ def patch_pipeline(monkeypatch, chunks, fail_with=None):
             raise fail_with
         return b"%PDF"
 
-    async def create_chunks(**_kwargs):
-        return chunks
-
     async def embed(texts):
         return [[0.0] * 3 for _ in texts], "bge-m3"
 
@@ -83,8 +80,8 @@ def patch_pipeline(monkeypatch, chunks, fail_with=None):
         pass
 
     monkeypatch.setattr(main, "get_content", get_content)
-    monkeypatch.setitem(main._PARSERS, "pdf", lambda _content: ("text", []))
-    monkeypatch.setattr(main.chunker, "create_chunks", create_chunks)
+    monkeypatch.setattr(main, "extract_blocks", lambda _content, _doc_type: [])
+    monkeypatch.setattr(main, "build_document_chunks", lambda _blocks: chunks)
     monkeypatch.setattr(main, "_embed", embed)
     monkeypatch.setattr(main, "_record_failure", record_failure)
 
@@ -96,7 +93,7 @@ def run_one(monkeypatch, doc, session=None):
 
 
 def test_indexed_document_counts_job_chunks_and_duration(monkeypatch):
-    chunks = [{"text": "a", "meta": {}}, {"text": "b", "meta": {}}, {"text": "c", "meta": {}}]
+    chunks = [{"chunk_index": i, "section": "С", "text": t} for i, t in enumerate("abc")]
     patch_pipeline(monkeypatch, chunks)
     jobs = sample("pochemuchnik_ingest_jobs_total", result="indexed")
     created = sample("pochemuchnik_ingest_chunks_created_total")
@@ -160,3 +157,14 @@ def test_queue_depth_reports_zero_for_missing_statuses(monkeypatch):
     assert sample("pochemuchnik_ingest_queue_depth", status="processing") == 0
     # IVHR-1: документы без файла видны отдельной серией (подмножество pending)
     assert sample("pochemuchnik_ingest_queue_depth", status="no_file") == 3
+
+
+def test_empty_document_ends_indexed_with_zero_chunks(monkeypatch):
+    patch_pipeline(monkeypatch, [])
+    doc = make_doc()
+    jobs = sample("pochemuchnik_ingest_jobs_total", result="indexed")
+
+    assert run_one(monkeypatch, doc) is True
+
+    assert doc.ingest_status == "indexed"
+    assert sample("pochemuchnik_ingest_jobs_total", result="indexed") == jobs + 1
