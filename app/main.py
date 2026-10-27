@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from errors import PermanentIngestError
 from parsers import get_content, parse_pdf, parse_docx, parse_txt
 from chunker import SmartChunker
+from metrics import CHUNKS_CREATED, JOB_DURATION, JOB_ERRORS, JOBS, QUEUE_DEPTH, start_metrics_server
 from mtls import ssl_context as mtls_ssl_context
 from pg_tls import create_engine, ssl_context
 
@@ -450,11 +451,14 @@ async def _record_failure(doc_id: uuid.UUID, attempt: int, exc: Exception) -> No
     Отдельной сессией: основная откатилась вместе с частично записанными чанками.
     """
     permanent = isinstance(exc, PermanentIngestError)
+    JOB_ERRORS.labels(type=type(exc).__name__ if permanent else "transient").inc()
     if permanent or attempt >= INGEST_MAX_ATTEMPTS:
+        JOBS.labels(result="failed").inc()
         status, next_at = "failed", None
         err_text = str(exc) if permanent else f"Попытка {attempt}/{INGEST_MAX_ATTEMPTS}: {exc}"
         logger.error(f"Ошибка на {doc_id}, документ помечен failed: {err_text}")
     else:
+        JOBS.labels(result="retry").inc()
         delay = _retry_delay_sec(attempt)
         status, next_at = "pending", datetime.now(timezone.utc) + timedelta(seconds=delay)
         err_text = f"Попытка {attempt}/{INGEST_MAX_ATTEMPTS}: {exc}"
@@ -512,10 +516,12 @@ async def process_one_document() -> bool:
             doc.ingest_next_attempt_at = None
             doc.ingest_error = f"Исчерпано {doc.ingest_attempts} попыток обработки; {reason}"
             await session.commit()
+            JOBS.labels(result="failed").inc()
             logger.error(f"{doc.title}: {doc.ingest_error}")
             return True
 
         attempt = doc.ingest_attempts + 1
+        attempt_started = time.perf_counter()
         logger.info(f"Обработка: {doc.title} (попытка {attempt}/{INGEST_MAX_ATTEMPTS})")
 
         try:
@@ -583,10 +589,14 @@ async def process_one_document() -> bool:
             doc.ingest_attempts = 0
             doc.ingest_next_attempt_at = None
             await session.commit()
+            JOBS.labels(result="indexed").inc()
+            CHUNKS_CREATED.inc(len(chunks_list))
+            JOB_DURATION.labels(result="indexed").observe(time.perf_counter() - attempt_started)
             logger.info(f"Готово: {doc.title}")
 
         except Exception as e:
             await session.rollback()
+            JOB_DURATION.labels(result="error").observe(time.perf_counter() - attempt_started)
             await _record_failure(doc_id, attempt, e)
 
     return True
@@ -674,6 +684,34 @@ async def _seconds_until_next_retry() -> Optional[float]:
         ).scalar()
 
 
+QUEUE_DEPTH_INTERVAL_SEC = int(os.environ.get("QUEUE_DEPTH_INTERVAL_SEC", 15))
+
+
+async def refresh_queue_depth() -> None:
+    """Обновляет gauge очереди: сколько документов ждут обработки и сколько в работе."""
+    async with async_session() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT ingest_status, count(*) FROM library.documents "
+                    "WHERE ingest_status IN ('pending', 'processing') GROUP BY ingest_status"
+                )
+            )
+        ).all()
+    counts = {status: count for status, count in rows}
+    for status in ("pending", "processing"):
+        QUEUE_DEPTH.labels(status=status).set(counts.get(status, 0))
+
+
+async def _queue_depth_loop() -> None:
+    while True:
+        try:
+            await refresh_queue_depth()
+        except Exception as exc:
+            logger.warning(f"Не удалось обновить глубину очереди для метрик: {exc}")
+        await asyncio.sleep(QUEUE_DEPTH_INTERVAL_SEC)
+
+
 async def _heartbeat() -> None:
     while True:
         try:
@@ -691,6 +729,9 @@ async def main():
     # Файл от прошлого запуска контейнера (restart сохраняет файловую систему) не должен
     # выдавать ещё не прошедший стартовые проверки воркер за здоровый.
     Path(HEARTBEAT_FILE).unlink(missing_ok=True)
+
+    start_metrics_server()
+    queue_depth = asyncio.create_task(_queue_depth_loop())  # noqa: F841 — ссылка нужна, чтобы задачу не собрал GC
 
     logger.info("IngestWorker запущен, проверяем конфигурацию эмбеддингов...")
     await verify_embedding_setup()

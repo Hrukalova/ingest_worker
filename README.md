@@ -276,3 +276,18 @@ docker compose up --build
 политикой «кто что может» (`main/infra/mtls`). Модуль одинаков в chat-svc, db-svc,
 graph-rag-svc и ingest-worker, менять его нужно во всех сразу. Включение и проверка —
 `main/infra/pki/README.md`, раздел «mTLS между сервисами».
+
+## Метрики
+
+Метрики Prometheus (префикс `pochemuchnik_`). Код: `app/metrics.py`, тесты: `tests/`. Общая картина и дашборды - `infra/observability/README.md` в корневом репозитории.
+
+У воркера нет HTTP-сервера приложения, поэтому метрики отдаёт отдельный маленький сервер на порту `METRICS_PORT` (по умолчанию 9464; открыт только внутри сети compose).
+
+| Метрика | Что считает |
+| :-- | :-- |
+| `ingest_queue_depth{status}` | документы в очереди (`pending`, `processing`); обновляется раз в `QUEUE_DEPTH_INTERVAL_SEC` (15 с) |
+| `ingest_jobs_total{result}` | попытки обработки: `indexed`, `retry`, `failed` |
+| `ingest_job_duration_seconds{result}` | длительность попытки (`indexed`, `error`) |
+| `ingest_chunks_created_total` | чанки, записанные в `library.chunks` |
+| `ingest_job_errors_total{type}` | ошибки: `FileTooLargeError`, `DocumentParseError`, `PermanentIngestError`, `transient` |
+
