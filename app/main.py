@@ -686,6 +686,49 @@ async def _seconds_until_next_retry() -> Optional[float]:
 
 QUEUE_DEPTH_INTERVAL_SEC = int(os.environ.get("QUEUE_DEPTH_INTERVAL_SEC", 15))
 
+# Документ без записи в library.document_files воркер не видит: выборка идёт через JOIN. Раньше такие
+# документы молча висели в pending. Теперь спустя INGEST_NO_FILE_GRACE_SEC после создания им пишется
+# понятная ошибка (видна в админке), а их число отдаётся в метрике очереди со статусом no_file.
+# Статус остаётся pending: как только файл появится, документ подхватится сам.
+INGEST_NO_FILE_GRACE_SEC = int(os.environ.get("INGEST_NO_FILE_GRACE_SEC", 300))
+NO_FILE_ERROR = (
+    "К документу не привязан файл: нет записи в library.document_files, обработка невозможна. "
+    "Загрузите файл через админ-панель (MinIO → импорт файлов)."
+)
+
+_NO_FILE_WHERE = """
+    d.ingest_status = 'pending'
+    AND NOT EXISTS (SELECT 1 FROM library.document_files f WHERE f.document_id = d.id)
+"""
+
+
+async def flag_documents_without_file() -> int:
+    """Помечает pending-документы без файла понятной ошибкой; возвращает их число."""
+    async with async_session() as session:
+        flagged = (
+            await session.execute(
+                text(
+                    f"""
+                    UPDATE library.documents d
+                    SET ingest_error = :err
+                    WHERE {_NO_FILE_WHERE}
+                      AND d.created_at < now() - make_interval(secs => :grace)
+                      AND d.ingest_error IS DISTINCT FROM :err
+                    RETURNING d.title
+                    """
+                ),
+                {"err": NO_FILE_ERROR, "grace": INGEST_NO_FILE_GRACE_SEC},
+            )
+        ).scalars().all()
+        await session.commit()
+        total = (
+            await session.execute(text(f"SELECT count(*) FROM library.documents d WHERE {_NO_FILE_WHERE}"))
+        ).scalar()
+    if flagged:
+        sample = ", ".join(flagged[:5]) + (" …" if len(flagged) > 5 else "")
+        logger.warning(f"Документов без файла в очереди: {len(flagged)} новых ({sample}). {NO_FILE_ERROR}")
+    return total or 0
+
 
 async def refresh_queue_depth() -> None:
     """Обновляет gauge очереди: сколько документов ждут обработки и сколько в работе."""
@@ -701,6 +744,8 @@ async def refresh_queue_depth() -> None:
     counts = {status: count for status, count in rows}
     for status in ("pending", "processing"):
         QUEUE_DEPTH.labels(status=status).set(counts.get(status, 0))
+    # Подмножество pending: ждут не очереди, а файла.
+    QUEUE_DEPTH.labels(status="no_file").set(await flag_documents_without_file())
 
 
 async def _queue_depth_loop() -> None:

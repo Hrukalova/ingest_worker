@@ -112,6 +112,17 @@ PostgreSQL (library.documents)
 обнуляет счётчик и задержку, когда документ возвращают в `pending` из `indexed`/`failed`
 (новая версия или ручной reindex), — у него снова полный запас попыток.
 
+### Документы без файла
+
+Выборка идёт через `JOIN library.document_files`, поэтому документ без записи о файле воркер не
+видит. Раньше такие документы молча висели в `pending`. Теперь спустя `INGEST_NO_FILE_GRACE_SEC`
+(300 с) после создания такому документу пишется `ingest_error` («К документу не привязан файл…»,
+виден в админке), в лог уходит предупреждение, а число таких документов отдаётся метрикой
+`ingest_queue_depth{status="no_file"}`. Статус остаётся `pending`: когда файл появится, документ
+подхватится сам. `db-svc` при привязке файла (импорт файлов и zip) сам ставит документ в очередь,
+сбрасывает ошибку и будит воркер через NOTIFY; если файл тот же и документ уже проиндексирован,
+повторной индексации нет.
+
 ## Стратегия чанкинга (SmartChunker)
 
 Выбор метода производится автоматически на основе типа и структуры документа.
@@ -285,7 +296,7 @@ graph-rag-svc и ingest-worker, менять его нужно во всех с�
 
 | Метрика | Что считает |
 | :-- | :-- |
-| `ingest_queue_depth{status}` | документы в очереди (`pending`, `processing`); обновляется раз в `QUEUE_DEPTH_INTERVAL_SEC` (15 с) |
+| `ingest_queue_depth{status}` | документы в очереди (`pending`, `processing`) и `no_file` (подмножество `pending`: нет записи в `library.document_files`); обновляется раз в `QUEUE_DEPTH_INTERVAL_SEC` (15 с) |
 | `ingest_jobs_total{result}` | попытки обработки: `indexed`, `retry`, `failed` |
 | `ingest_job_duration_seconds{result}` | длительность попытки (`indexed`, `error`) |
 | `ingest_chunks_created_total` | чанки, записанные в `library.chunks` |

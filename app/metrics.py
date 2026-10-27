@@ -14,7 +14,7 @@ METRICS_PORT = int(os.environ.get("METRICS_PORT", "9464"))
 QUEUE_DEPTH = Gauge(
     "pochemuchnik_ingest_queue_depth",
     "Документы в очереди индексации по статусу",
-    ["status"],  # pending | processing
+    ["status"],  # pending | processing | no_file (подмножество pending: нет записи в document_files)
 )
 JOBS = Counter(
     "pochemuchnik_ingest_jobs_total",

@@ -150,7 +150,13 @@ def test_permanent_error_fails_immediately_and_is_counted_by_class(monkeypatch):
 
 
 def test_queue_depth_reports_zero_for_missing_statuses(monkeypatch):
+    async def no_file():
+        return 3
+
     monkeypatch.setattr(main, "async_session", lambda: FakeSession(rows=[("pending", 4)]))
+    monkeypatch.setattr(main, "flag_documents_without_file", no_file)
     asyncio.run(main.refresh_queue_depth())
     assert sample("pochemuchnik_ingest_queue_depth", status="pending") == 4
     assert sample("pochemuchnik_ingest_queue_depth", status="processing") == 0
+    # IVHR-1: документы без файла видны отдельной серией (подмножество pending)
+    assert sample("pochemuchnik_ingest_queue_depth", status="no_file") == 3
