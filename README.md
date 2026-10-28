@@ -60,10 +60,13 @@ PostgreSQL (library.documents)
         └── build_document_chunks (нарезка по пайплайну ноутбука)
         │
         ▼
-  embedding-svc POST /embed   ← единственный источник векторов в системе
+  embedding-svc POST /embed, kind=passage   ← единственный источник векторов в системе
         │
         ▼
   library.chunks + library.chunk_embeddings
+
+  library.quick_answer_variants / library.links без вектора
+        └── aux_index → embedding-svc → embedding, embedding_model
 ```
 
 Своей модели эмбеддингов у воркера нет: и он, и `graph-rag-svc` считают векторы через
@@ -130,6 +133,17 @@ PostgreSQL (library.documents)
 - **Чанки** (`notebook_chunker.build_document_chunks`): абзацы одного раздела копятся до 1600 символов, длинный текст режется по предложениям (до 1400, слишком длинное предложение — жёстко); разные разделы не склеиваются; последний абзац длиной до 350 символов переходит в следующий чанк; чанки короче 80 символов отбрасываются.
 - **Текст для эмбеддинга** (`embedding_text`): `Название документа / Категория / Раздел / Текст`. Префикс `passage: ` добавляет `embedding-svc` по полю `kind` (воркер шлёт `"kind": "passage"`). Тот же формат использует BM25 в `graph-rag-svc`, менять его нельзя.
 
+## Быстрые ответы и ссылки
+
+`aux_index.py` досчитывает векторы строк `library.quick_answer_variants` (текст варианта) и
+`library.links` (описание), у которых `embedding IS NULL`: их кладёт импорт `db-svc`, а триггер
+миграции 011 шлёт `NOTIFY` в тот же канал `ingest_jobs` (payload `таблица:id`, воркер считает его
+только сигналом проснуться). Модель та же, что у чанков (`kind="passage"`), в `embedding_model`
+пишется имя от `embedding-svc`. Текст берётся как хранится: нормализацию вариантов делает импортёр
+`db-svc`, повторять её здесь нельзя. Пустые строки (только ASCII-пробелы) пропускаются одинаково
+в SQL и в Python. Варианты неактивных ответов и неактивные ссылки не встраиваются. Права
+`ingest_user` на эти таблицы — миграция `012_notebook_grants.sql`.
+
 ## Структура проекта
 
 ```
@@ -138,6 +152,7 @@ app/
   errors.py    — PermanentIngestError и наследники: ошибки, которые не повторяются
   notebook_parsing.py — extract_blocks, clean_text (порт ячейки 9 ноутбука)
   notebook_chunker.py — split_long_text, build_document_chunks, embedding_text (ячейка 11)
+  aux_index.py — эмбеддинги вариантов быстрых ответов и ссылок
   parsers.py   — загрузка файла (local, http, S3) с проверкой размера
 requirements.txt
 Dockerfile
@@ -151,7 +166,7 @@ docker-compose.yml
 | ------------------------ | -------------------------------------- | ------------------------------------------------------------------- |
 | `DATABASE_URL`         | —                                     | PostgreSQL connection string (asyncpg)                              |
 | `EMBEDDING_SVC_URL`    | `http://embedding-svc:8000`          | Сервис эмбеддингов — единственный источник векторов |
-| `EMBEDDING_DIM`        | `1024`                               | Ожидаемая размерность; сверяется при запуске с моделью и с колонкой БД |
+| `EMBEDDING_DIM`        | `768`                                | Ожидаемая размерность; сверяется при запуске с моделью и с колонкой БД |
 | `EMBED_BATCH_SIZE`     | `64`                                 | Размер батча к `embedding-svc`; должен быть меньше его `MAX_TEXTS_PER_REQUEST` |
 | `MAX_FILE_SIZE_MB`     | `50`                                 | Предел размера исходного файла; больше — сразу `failed` |
 | `INGEST_MAX_ATTEMPTS`  | `5`                                  | Число попыток обработки документа |
@@ -190,7 +205,7 @@ docker compose up --build
 
 `library.chunk_embeddings`:
 
-- `embedding` — вектор размерности `EMBEDDING_DIM` (1024 для `mxbai-embed-large-v1`), как есть,
+- `embedding` — вектор размерности `EMBEDDING_DIM` (768 для `intfloat/multilingual-e5-base`), как есть,
   без дополнения нулями и без обрезки
 - `embedding_model` — имя модели, которое вернул `embedding-svc` (авторитетный источник)
 
