@@ -491,17 +491,22 @@ async def _record_failure(doc_id: uuid.UUID, attempt: int, exc: Exception) -> No
             logger.error(f"Не удалось записать ошибку в БД: {db_err}")
 
 
+def _claim_query():
+    """Выборка одной задачи. Блокировка только строки documents (OF): у роли ingest_user на
+    document_files лишь SELECT, и без OF FOR UPDATE охватил бы обе таблицы (permission denied)."""
+    return (
+        select(Document, DocumentFile)
+        .join(DocumentFile, Document.id == DocumentFile.document_id)
+        .where(_claimable())
+        .with_for_update(skip_locked=True, of=Document)
+        .limit(1)
+    )
+
+
 async def process_one_document() -> bool:
     async with async_session() as session:
         # 1. Выбираем задачу (SKIP LOCKED — параллельность без коллизий)
-        query = (
-            select(Document, DocumentFile)
-            .join(DocumentFile, Document.id == DocumentFile.document_id)
-            .where(_claimable())
-            .with_for_update(skip_locked=True)
-            .limit(1)
-        )
-        res = await session.execute(query)
+        res = await session.execute(_claim_query())
         result_row = res.unique().fetchone()
         if not result_row:
             return False
