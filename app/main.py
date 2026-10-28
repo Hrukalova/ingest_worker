@@ -40,7 +40,7 @@ DATABASE_URL  = os.environ["DATABASE_URL"]
 # Имя модели здесь намеренно не задаётся: авторитетным является то, что вернул сервис,
 # иначе появляется второе место, объявляющее модель, и они расходятся.
 EMBEDDING_SVC_URL        = os.environ.get("EMBEDDING_SVC_URL", "http://embedding-svc:8000")
-EMBEDDING_DIM            = int(os.environ.get("EMBEDDING_DIM", 1024))
+EMBEDDING_DIM            = int(os.environ.get("EMBEDDING_DIM", 768))
 EMBED_REQUEST_TIMEOUT    = int(os.environ.get("EMBED_REQUEST_TIMEOUT_SEC", 120))
 # Размер батча при обращении к embedding-svc. Должен быть заведомо меньше лимита на
 # стороне сервиса: документ может дать сотни чанков, и отправлять их одним запросом
